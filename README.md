@@ -36,6 +36,31 @@ python -m pip install Pillow opencv-python-headless
 ## ファイル
 
 - `crop_right_talent.py`
+- `New-FfmpegFrameExtractCommandGui.pyw`
+- `Open-New-FfmpegFrameExtractCommandGui.cmd`
+
+## ffmpeg コマンド GUI
+
+動画から静止画フレームを抜くための `ffmpeg` コマンドを GUI で組み立てるツールです。
+
+- ダブルクリック起動:
+  - `Open-New-FfmpegFrameExtractCommandGui.cmd`
+- Python から直接起動:
+
+```powershell
+py -3 .\New-FfmpegFrameExtractCommandGui.pyw
+```
+
+主な機能:
+
+- 入力動画ファイル選択
+- 出力フォルダ選択
+- `10秒ごと / 5秒ごと / 1秒ごと / 指定秒ごと / 全フレーム`
+- `jpg / png` 切替
+- `-ss` と `-t` の付与
+- PowerShell 用コマンド生成
+- クリップボードコピー
+- 前回設定の JSON 保存復元
 
 ## 使い方
 
