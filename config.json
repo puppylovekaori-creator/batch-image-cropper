@@ -1,0 +1,16 @@
+{
+  "InputZipFolder": "",
+  "OutputFolder": "",
+  "TempFolder": "",
+  "DoneFolder": "",
+  "SelectedMinFaceRatio": 0.05,
+  "ReviewMinFaceRatio": 0.018,
+  "BlurThreshold": 90.0,
+  "ContactSheetColumns": 5,
+  "ThumbnailWidth": 220,
+  "MoveDoneZip": true,
+  "DeleteTempFolder": true,
+  "OverwriteOutput": false,
+  "CopyExcludeImages": false,
+  "WindowGeometry": "1240x900"
+}
