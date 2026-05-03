@@ -60,23 +60,25 @@ STATUS_STOPPED = "停止"
 MODE_LABELS = {
     "manual_scale": "手動倍率補正",
 }
+DEFAULT_X_SCALE = 1.185185
+DEFAULT_Y_SCALE = 1.0
+CUSTOM_PRESET_LABEL = "カスタム"
 CONTENT_PRESET_LABELS = {
-    "横を少し縮める 98%": (0.98, 1.0),
-    "横を縮める 95%": (0.95, 1.0),
-    "横を強めに縮める 90%": (0.90, 1.0),
-    "縦を少し縮める 98%": (1.0, 0.98),
-    "縦を縮める 95%": (1.0, 0.95),
+    "720x480 → 16:9表示相当補正": (1.185185, 1.0),
     "変更なし": (1.0, 1.0),
+    "横を少し縮める": (0.98, 1.0),
+    "横を縮める": (0.95, 1.0),
+    "横を少し広げる": (1.05, 1.0),
+    "縦を少し縮める": (1.0, 0.98),
+    "縦を縮める": (1.0, 0.95),
+    CUSTOM_PRESET_LABEL: None,
 }
-DEFAULT_CONTENT_PRESET_LABEL = "横を縮める 95%"
+DEFAULT_CONTENT_PRESET_LABEL = "720x480 → 16:9表示相当補正"
 CANVAS_PROCESSING_LABELS = {
-    "content_only": "内容サイズのまま保存",
-    "original_fit": "元画像サイズに合わせる",
+    "none": "なし",
+    "original_fit": "元画像サイズに中央配置",
     "original_crop": "元画像サイズに中央クロップ",
-    "aspect_ratio_fit": "16:9キャンバスに配置",
-}
-CANVAS_FILL_LABELS = {
-    "color": "余白色",
+    "aspect_ratio_fit": "指定比率キャンバスに配置",
     "blur": "ぼかし背景",
 }
 CANVAS_PAD_COLOR_LABELS = {
@@ -99,7 +101,6 @@ INTERPOLATION_LABELS = {
 
 MODE_LABEL_TO_KEY = {label: key for key, label in MODE_LABELS.items()}
 CANVAS_PROCESSING_LABEL_TO_KEY = {label: key for key, label in CANVAS_PROCESSING_LABELS.items()}
-CANVAS_FILL_LABEL_TO_KEY = {label: key for key, label in CANVAS_FILL_LABELS.items()}
 CANVAS_PAD_COLOR_LABEL_TO_KEY = {label: key for key, label in CANVAS_PAD_COLOR_LABELS.items()}
 OUTPUT_FORMAT_LABEL_TO_KEY = {label: key for key, label in OUTPUT_FORMAT_LABELS.items()}
 INTERPOLATION_LABEL_TO_KEY = {label: key for key, label in INTERPOLATION_LABELS.items()}
@@ -144,12 +145,11 @@ class AppConfig:
     keep_folder_structure_when_folder_added: bool = False
     extensions: list[str] = field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
     mode: str = "manual_scale"
-    x_scale: float = 0.95
-    y_scale: float = 1.0
+    x_scale: float = DEFAULT_X_SCALE
+    y_scale: float = DEFAULT_Y_SCALE
     content_preset: str = DEFAULT_CONTENT_PRESET_LABEL
-    canvas_processing: str = "content_only"
+    canvas_processing: str = "none"
     save_canvas_aspect_ratio: str = "16:9"
-    canvas_fill_mode: str = "color"
     canvas_pad_color: str = "black"
     output_format: str = "keep_original"
     suffix: str = "_aspectfix"
@@ -163,28 +163,30 @@ class AppConfig:
     @classmethod
     def from_dict(cls, raw: object) -> "AppConfig":
         data = raw if isinstance(raw, dict) else {}
+        x_scale = max(0.01, _safe_float(data.get("XScale", DEFAULT_X_SCALE), DEFAULT_X_SCALE))
+        y_scale = max(0.01, _safe_float(data.get("YScale", DEFAULT_Y_SCALE), DEFAULT_Y_SCALE))
+        content_preset = normalize_content_preset(
+            _safe_string(data.get("DefaultPreset", data.get("ContentPreset", ""))),
+            x_scale,
+            y_scale,
+        )
+        canvas_processing = normalize_canvas_mode(
+            _safe_string(data.get("CanvasMode", data.get("CanvasProcessing", ""))),
+            data,
+        )
         return cls(
             output_folder=_safe_string(data.get("OutputFolder", r"C:\output_aspect_fixed")),
             recursive_folder_drop=_safe_bool(data.get("RecursiveFolderDrop", True)),
             keep_folder_structure_when_folder_added=_safe_bool(data.get("KeepFolderStructureWhenFolderAdded", False)),
             extensions=normalize_extensions(data.get("Extensions", DEFAULT_EXTENSIONS)),
             mode=normalize_choice(_safe_string(data.get("Mode", "manual_scale")), MODE_LABELS, "manual_scale"),
-            x_scale=max(0.01, _safe_float(data.get("XScale", 0.95), 0.95)),
-            y_scale=max(0.01, _safe_float(data.get("YScale", 1.0), 1.0)),
-            content_preset=_safe_string(data.get("ContentPreset", DEFAULT_CONTENT_PRESET_LABEL)) or DEFAULT_CONTENT_PRESET_LABEL,
-            canvas_processing=normalize_choice(
-                _safe_string(data.get("CanvasProcessing", _legacy_canvas_processing_key(data))),
-                CANVAS_PROCESSING_LABELS,
-                "content_only",
-            ),
+            x_scale=x_scale,
+            y_scale=y_scale,
+            content_preset=content_preset,
+            canvas_processing=canvas_processing,
             save_canvas_aspect_ratio=(
                 _safe_string(data.get("SaveCanvasAspectRatio", _safe_string(data.get("TargetAspectRatio", "16:9"))))
                 or "16:9"
-            ),
-            canvas_fill_mode=normalize_choice(
-                _safe_string(data.get("CanvasFillMode", _legacy_canvas_fill_mode_key(data))),
-                CANVAS_FILL_LABELS,
-                "color",
             ),
             canvas_pad_color=normalize_choice(
                 _safe_string(data.get("CanvasPadColor", _legacy_canvas_pad_color_key(data))),
@@ -218,11 +220,10 @@ class AppConfig:
             "Mode": self.mode,
             "XScale": self.x_scale,
             "YScale": self.y_scale,
-            "ContentPreset": self.content_preset,
-            "CanvasProcessing": self.canvas_processing,
+            "DefaultPreset": self.content_preset,
+            "CanvasMode": canvas_processing_name(self.canvas_processing),
             "SaveCanvasAspectRatio": self.save_canvas_aspect_ratio,
-            "CanvasFillMode": self.canvas_fill_mode,
-            "CanvasPadColor": self.canvas_pad_color,
+            "CanvasPadColor": canvas_pad_color_name(self.canvas_pad_color),
             "OutputFormat": self.output_format,
             "Suffix": self.suffix,
             "JpegQuality": self.jpeg_quality,
@@ -249,7 +250,7 @@ class ProcessItem:
     corrected_aspect_text: str = "-"
     output_size: tuple[int, int] | None = None
     output_aspect_text: str = "-"
-    canvas_status_text: str = "内容補正のみ"
+    canvas_status_text: str = "倍率補正のみ / キャンバス処理なし"
     error_text: str = ""
     processed_at: datetime | None = None
 
@@ -321,7 +322,7 @@ class AspectFixApp(AppBase):
         self.preview_after_label: ttk.Label | None = None
         self.preview_file_name_var = tk.StringVar(value="-")
         self.preview_status_var = tk.StringVar(value="プレビュー未作成")
-        self.preview_after_caption_var = tk.StringVar(value="内容補正のみ")
+        self.preview_after_caption_var = tk.StringVar(value="倍率補正のみ / キャンバス処理なし")
         self._pending_output_refresh: str | None = None
 
         self.output_folder_var = tk.StringVar()
@@ -334,7 +335,6 @@ class AspectFixApp(AppBase):
         self.y_scale_var = tk.StringVar()
         self.canvas_processing_var = tk.StringVar()
         self.save_canvas_aspect_ratio_var = tk.StringVar()
-        self.canvas_fill_mode_var = tk.StringVar()
         self.canvas_pad_color_var = tk.StringVar()
         self.output_format_var = tk.StringVar()
         self.suffix_var = tk.StringVar()
@@ -421,7 +421,7 @@ class AspectFixApp(AppBase):
         group_row.columnconfigure(0, weight=1)
         group_row.columnconfigure(1, weight=1)
 
-        content_frame = ttk.LabelFrame(group_row, text="1. 内容の歪み補正", padding=12)
+        content_frame = ttk.LabelFrame(group_row, text="1. 倍率補正", padding=12)
         content_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         for column in range(4):
             content_frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
@@ -445,7 +445,7 @@ class AspectFixApp(AppBase):
         canvas_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         for column in range(4):
             canvas_frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
-        ttk.Label(canvas_frame, text="保存キャンバス処理").grid(row=0, column=0, sticky="w")
+        ttk.Label(canvas_frame, text="キャンバス処理").grid(row=0, column=0, sticky="w")
         self.canvas_processing_combo = ttk.Combobox(
             canvas_frame,
             textvariable=self.canvas_processing_var,
@@ -456,22 +456,14 @@ class AspectFixApp(AppBase):
         ttk.Label(canvas_frame, text="保存キャンバス比率").grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.save_canvas_aspect_entry = ttk.Entry(canvas_frame, textvariable=self.save_canvas_aspect_ratio_var)
         self.save_canvas_aspect_entry.grid(row=1, column=1, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(canvas_frame, text="余白の埋め方").grid(row=1, column=2, sticky="w", pady=(10, 0))
-        self.canvas_fill_mode_combo = ttk.Combobox(
-            canvas_frame,
-            textvariable=self.canvas_fill_mode_var,
-            values=list(CANVAS_FILL_LABELS.values()),
-            state="readonly",
-        )
-        self.canvas_fill_mode_combo.grid(row=1, column=3, sticky="ew", pady=(10, 0))
-        ttk.Label(canvas_frame, text="余白色").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(canvas_frame, text="余白色").grid(row=1, column=2, sticky="w", pady=(10, 0))
         self.canvas_pad_color_combo = ttk.Combobox(
             canvas_frame,
             textvariable=self.canvas_pad_color_var,
             values=list(CANVAS_PAD_COLOR_LABELS.values()),
             state="readonly",
         )
-        self.canvas_pad_color_combo.grid(row=2, column=1, sticky="ew", padx=(8, 12), pady=(10, 0))
+        self.canvas_pad_color_combo.grid(row=1, column=3, sticky="ew", pady=(10, 0))
 
         save_frame = ttk.LabelFrame(settings_frame, text="保存設定", padding=12)
         save_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -611,9 +603,9 @@ class AspectFixApp(AppBase):
         ttk.Label(info_frame, textvariable=self.selected_size_var).grid(row=0, column=3, sticky="w", padx=(8, 0))
         ttk.Label(info_frame, text="元アスペクト比").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(info_frame, textvariable=self.selected_aspect_var).grid(row=1, column=1, sticky="w", padx=(8, 12), pady=(8, 0))
-        ttk.Label(info_frame, text="内容補正後サイズ").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(info_frame, text="倍率補正後サイズ").grid(row=1, column=2, sticky="w", pady=(8, 0))
         ttk.Label(info_frame, textvariable=self.corrected_size_var).grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(info_frame, text="内容補正後アスペクト比").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(info_frame, text="倍率補正後アスペクト比").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Label(info_frame, textvariable=self.corrected_aspect_var).grid(row=2, column=1, sticky="w", padx=(8, 12), pady=(8, 0))
         ttk.Label(info_frame, text="保存サイズ").grid(row=2, column=2, sticky="w", pady=(8, 0))
         ttk.Label(info_frame, textvariable=self.saved_size_var).grid(row=2, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
@@ -626,7 +618,7 @@ class AspectFixApp(AppBase):
         preview_frame.rowconfigure(0, weight=1)
         ttk.Label(
             preview_frame,
-            text="プレビュー更新を押すと、左に補正前、右に内容補正後または保存結果を別ウィンドウで表示します。",
+            text="プレビュー更新を押すと、左に補正前、右に倍率補正後の画像内容を別ウィンドウで表示します。保存時のキャンバス処理は状態表示で確認できます。",
             justify="left",
         ).grid(row=0, column=0, sticky="nw")
 
@@ -643,14 +635,13 @@ class AspectFixApp(AppBase):
         self.keep_structure_var.set(config.keep_folder_structure_when_folder_added)
         self.extensions_var.set(", ".join(config.extensions))
         self.mode_var.set(MODE_LABELS.get(config.mode, MODE_LABELS["manual_scale"]))
-        self.content_preset_var.set(config.content_preset or guess_content_preset_label(config.x_scale, config.y_scale))
+        self.content_preset_var.set(normalize_content_preset(config.content_preset, config.x_scale, config.y_scale))
         self.x_scale_var.set(_format_number(config.x_scale))
         self.y_scale_var.set(_format_number(config.y_scale))
         self.canvas_processing_var.set(
-            CANVAS_PROCESSING_LABELS.get(config.canvas_processing, CANVAS_PROCESSING_LABELS["content_only"])
+            CANVAS_PROCESSING_LABELS.get(config.canvas_processing, CANVAS_PROCESSING_LABELS["none"])
         )
         self.save_canvas_aspect_ratio_var.set(config.save_canvas_aspect_ratio)
-        self.canvas_fill_mode_var.set(CANVAS_FILL_LABELS.get(config.canvas_fill_mode, CANVAS_FILL_LABELS["color"]))
         self.canvas_pad_color_var.set(
             CANVAS_PAD_COLOR_LABELS.get(config.canvas_pad_color, CANVAS_PAD_COLOR_LABELS["black"])
         )
@@ -666,11 +657,8 @@ class AspectFixApp(AppBase):
         watched_vars: list[tk.Variable] = [
             self.output_folder_var,
             self.keep_structure_var,
-            self.x_scale_var,
-            self.y_scale_var,
             self.canvas_processing_var,
             self.save_canvas_aspect_ratio_var,
-            self.canvas_fill_mode_var,
             self.canvas_pad_color_var,
             self.output_format_var,
             self.suffix_var,
@@ -678,8 +666,9 @@ class AspectFixApp(AppBase):
         ]
         for variable in watched_vars:
             variable.trace_add("write", lambda *_: self._schedule_output_refresh())
+        self.x_scale_var.trace_add("write", lambda *_: self._on_scale_fields_changed())
+        self.y_scale_var.trace_add("write", lambda *_: self._on_scale_fields_changed())
         self.canvas_processing_var.trace_add("write", lambda *_: self._update_canvas_control_states())
-        self.canvas_fill_mode_var.trace_add("write", lambda *_: self._update_canvas_control_states())
 
     def _on_content_preset_changed(self, _event: Any) -> None:
         preset_label = self.content_preset_var.get().strip()
@@ -690,23 +679,33 @@ class AspectFixApp(AppBase):
         self.x_scale_var.set(_format_number(x_scale))
         self.y_scale_var.set(_format_number(y_scale))
 
-    def _update_canvas_control_states(self) -> None:
-        processing_key = CANVAS_PROCESSING_LABEL_TO_KEY.get(self.canvas_processing_var.get().strip(), "content_only")
-        fill_key = CANVAS_FILL_LABEL_TO_KEY.get(self.canvas_fill_mode_var.get().strip(), "color")
+    def _on_scale_fields_changed(self) -> None:
+        self._sync_preset_from_scale_fields()
+        self._schedule_output_refresh()
 
-        if processing_key == "aspect_ratio_fit":
+    def _sync_preset_from_scale_fields(self) -> None:
+        try:
+            x_scale = float(self.x_scale_var.get().strip())
+            y_scale = float(self.y_scale_var.get().strip())
+            if x_scale <= 0 or y_scale <= 0:
+                return
+        except Exception:
+            return
+        preset_label = guess_content_preset_label(x_scale, y_scale)
+        if self.content_preset_var.get().strip() != preset_label:
+            self.content_preset_var.set(preset_label)
+
+    def _update_canvas_control_states(self) -> None:
+        processing_key = CANVAS_PROCESSING_LABEL_TO_KEY.get(self.canvas_processing_var.get().strip(), "none")
+
+        if processing_key in {"aspect_ratio_fit", "blur"}:
             self.save_canvas_aspect_entry.configure(state="normal")
         else:
             self.save_canvas_aspect_entry.configure(state="disabled")
 
         if processing_key in {"original_fit", "aspect_ratio_fit"}:
-            self.canvas_fill_mode_combo.configure(state="readonly")
-            if fill_key == "color":
-                self.canvas_pad_color_combo.configure(state="readonly")
-            else:
-                self.canvas_pad_color_combo.configure(state="disabled")
+            self.canvas_pad_color_combo.configure(state="readonly")
         else:
-            self.canvas_fill_mode_combo.configure(state="disabled")
             self.canvas_pad_color_combo.configure(state="disabled")
 
     def _register_drop_targets(self) -> None:
@@ -1017,9 +1016,7 @@ class AspectFixApp(AppBase):
                 self.preview_after_label.configure(image=self.preview_after_photo, text="")
             self.preview_file_name_var.set(item.source_path.name)
             self.preview_after_caption_var.set(str(metadata["preview_status_text"]))
-            self.preview_status_var.set(
-                f"{metadata['preview_status_text']} / 内容補正後 {format_size(metadata['corrected_size'])} / 保存 {format_size(metadata['output_size'])}"
-            )
+            self.preview_status_var.set(build_preview_status_text(metadata, config))
             self.corrected_size_var.set(format_size(metadata["corrected_size"]))
             self.corrected_aspect_var.set(format_ratio_text(*metadata["corrected_size"]))
             self.saved_size_var.set(format_size(metadata["output_size"]))
@@ -1037,7 +1034,7 @@ class AspectFixApp(AppBase):
         self.preview_after_photo = None
         self.preview_file_name_var.set("-")
         self.preview_status_var.set("プレビュー未作成")
-        self.preview_after_caption_var.set("内容補正のみ")
+        self.preview_after_caption_var.set("倍率補正のみ / キャンバス処理なし")
         if self.preview_before_label is not None:
             self.preview_before_label.configure(image="", text="画像を選択してください")
         if self.preview_after_label is not None:
@@ -1060,9 +1057,10 @@ class AspectFixApp(AppBase):
         header = ttk.Frame(preview_window, padding=12)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
+        header.columnconfigure(2, weight=1)
         ttk.Label(header, text="ファイル名").grid(row=0, column=0, sticky="w")
         ttk.Label(header, textvariable=self.preview_file_name_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(header, textvariable=self.preview_status_var).grid(row=0, column=2, sticky="e")
+        ttk.Label(header, textvariable=self.preview_status_var, justify="left", wraplength=860).grid(row=0, column=2, sticky="ew")
 
         content = ttk.Frame(preview_window, padding=(12, 0, 12, 12))
         content.grid(row=1, column=0, sticky="nsew")
@@ -1077,7 +1075,7 @@ class AspectFixApp(AppBase):
         preview_before_label = ttk.Label(before_frame, text="画像を選択してください", anchor="center")
         preview_before_label.grid(row=0, column=0, sticky="nsew")
 
-        after_frame = ttk.LabelFrame(content, text="補正後プレビュー", padding=8)
+        after_frame = ttk.LabelFrame(content, text="倍率補正後プレビュー", padding=8)
         after_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         after_frame.columnconfigure(0, weight=1)
         after_frame.rowconfigure(1, weight=1)
@@ -1159,7 +1157,7 @@ class AspectFixApp(AppBase):
             item.corrected_aspect_text = "-"
             item.output_size = None
             item.output_aspect_text = "-"
-            item.canvas_status_text = "内容補正のみ"
+            item.canvas_status_text = "倍率補正のみ / キャンバス処理なし"
             item.processed_at = None
         self._refresh_all_tree_rows()
 
@@ -1178,10 +1176,9 @@ class AspectFixApp(AppBase):
             logger.info(f"追加された画像数: {len(items_snapshot)}")
             logger.info(f"処理開始時刻: {summary.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
             logger.info(
-                f"使用設定: 横倍率={config.x_scale:.4f}, 縦倍率={config.y_scale:.4f}, "
-                f"保存キャンバス処理={canvas_processing_name(config.canvas_processing)}, "
+                f"使用設定: 横倍率={format_scale(config.x_scale)}, 縦倍率={format_scale(config.y_scale)}, "
+                f"キャンバス処理={canvas_processing_name(config.canvas_processing)}, "
                 f"保存キャンバス比率={config.save_canvas_aspect_ratio}, "
-                f"余白処理={canvas_fill_name(config.canvas_fill_mode)}, "
                 f"余白色={canvas_pad_color_name(config.canvas_pad_color)}, "
                 f"出力形式={output_format_name(config.output_format)}"
             )
@@ -1224,10 +1221,9 @@ class AspectFixApp(AppBase):
                     summary.success_count += 1
                     logger.info(
                         f"{item.source_path.name}: 完了 / 元サイズ={format_size(metadata['source_size'])} / "
-                        f"内容補正後サイズ={format_size(metadata['corrected_size'])} / "
-                        f"出力サイズ={format_size(metadata['output_size'])} / 横倍率={config.x_scale:.4f} / "
-                        f"縦倍率={config.y_scale:.4f} / 保存キャンバス処理={canvas_processing_name(config.canvas_processing)} / "
-                        f"余白処理={canvas_fill_name(config.canvas_fill_mode)} / "
+                        f"倍率補正後サイズ={format_size(metadata['corrected_size'])} / "
+                        f"出力サイズ={format_size(metadata['output_size'])} / 横倍率={format_scale(config.x_scale)} / "
+                        f"縦倍率={format_scale(config.y_scale)} / キャンバス処理={canvas_processing_name(config.canvas_processing)} / "
                         f"保存先={output_path.name}"
                     )
                     self._send_ui_message(
@@ -1247,8 +1243,8 @@ class AspectFixApp(AppBase):
                     summary.failure_count += 1
                     logger.error(
                         f"{item.source_path.name}: 失敗 / 元サイズ={format_size(item.original_size)} / "
-                        f"横倍率={config.x_scale:.4f} / 縦倍率={config.y_scale:.4f} / "
-                        f"保存キャンバス処理={canvas_processing_name(config.canvas_processing)} / "
+                        f"横倍率={format_scale(config.x_scale)} / 縦倍率={format_scale(config.y_scale)} / "
+                        f"キャンバス処理={canvas_processing_name(config.canvas_processing)} / "
                         f"エラー={exc}"
                     )
                     self._send_ui_message(
@@ -1419,18 +1415,14 @@ class AspectFixApp(AppBase):
         extensions = normalize_extensions(self.extensions_var.get().split(","))
         mode = MODE_LABEL_TO_KEY.get(self.mode_var.get().strip(), "manual_scale")
         content_preset = self.content_preset_var.get().strip() or DEFAULT_CONTENT_PRESET_LABEL
-        canvas_processing = CANVAS_PROCESSING_LABEL_TO_KEY.get(
-            self.canvas_processing_var.get().strip(),
-            "content_only",
-        )
-        canvas_fill_mode = CANVAS_FILL_LABEL_TO_KEY.get(self.canvas_fill_mode_var.get().strip(), "color")
+        canvas_processing = CANVAS_PROCESSING_LABEL_TO_KEY.get(self.canvas_processing_var.get().strip(), "none")
         canvas_pad_color = CANVAS_PAD_COLOR_LABEL_TO_KEY.get(self.canvas_pad_color_var.get().strip(), "black")
         output_format = OUTPUT_FORMAT_LABEL_TO_KEY.get(self.output_format_var.get().strip(), "keep_original")
         interpolation = INTERPOLATION_LABEL_TO_KEY.get(self.interpolation_var.get().strip(), "lanczos")
         suffix = self.suffix_var.get().strip()
         save_canvas_aspect_ratio = self.save_canvas_aspect_ratio_var.get().strip()
-        x_scale = _safe_float(self.x_scale_var.get(), 0.95)
-        y_scale = _safe_float(self.y_scale_var.get(), 1.0)
+        x_scale = _safe_float(self.x_scale_var.get(), DEFAULT_X_SCALE)
+        y_scale = _safe_float(self.y_scale_var.get(), DEFAULT_Y_SCALE)
         jpeg_quality = _safe_int(self.jpeg_quality_var.get(), 95)
         webp_quality = _safe_int(self.webp_quality_var.get(), 95)
 
@@ -1449,7 +1441,7 @@ class AspectFixApp(AppBase):
                 raise ValueError("縦倍率は 0 より大きい値にしてください。")
             if not extensions:
                 raise ValueError("対象拡張子を 1 つ以上指定してください。")
-            if canvas_processing == "aspect_ratio_fit":
+            if canvas_processing in {"aspect_ratio_fit", "blur"}:
                 if not save_canvas_aspect_ratio:
                     raise ValueError("保存キャンバス比率を指定してください。")
                 parse_aspect_ratio(save_canvas_aspect_ratio)
@@ -1463,9 +1455,9 @@ class AspectFixApp(AppBase):
             if not suffix:
                 suffix = "_aspectfix"
             if x_scale <= 0:
-                x_scale = 0.95
+                x_scale = DEFAULT_X_SCALE
             if y_scale <= 0:
-                y_scale = 1.0
+                y_scale = DEFAULT_Y_SCALE
             if not extensions:
                 extensions = list(DEFAULT_EXTENSIONS)
             if not save_canvas_aspect_ratio:
@@ -1481,10 +1473,9 @@ class AspectFixApp(AppBase):
             mode=mode,
             x_scale=x_scale,
             y_scale=y_scale,
-            content_preset=content_preset,
+            content_preset=normalize_content_preset(content_preset, x_scale, y_scale),
             canvas_processing=canvas_processing,
             save_canvas_aspect_ratio=save_canvas_aspect_ratio,
-            canvas_fill_mode=canvas_fill_mode,
             canvas_pad_color=canvas_pad_color,
             output_format=output_format,
             suffix=suffix,
@@ -1630,12 +1621,12 @@ def build_output_plan(source_size: tuple[int, int], config: AppConfig) -> dict[s
         max(1, int(round(source_size[0] * config.x_scale))),
         max(1, int(round(source_size[1] * config.y_scale))),
     )
-    canvas_processing_applied = config.canvas_processing != "content_only"
+    canvas_processing_applied = config.canvas_processing != "none"
     output_size = corrected_size
 
     if config.canvas_processing in {"original_fit", "original_crop"}:
         output_size = source_size
-    elif config.canvas_processing == "aspect_ratio_fit":
+    elif config.canvas_processing in {"aspect_ratio_fit", "blur"}:
         target_ratio = parse_aspect_ratio(config.save_canvas_aspect_ratio)
         output_size = calculate_ratio_canvas_size(corrected_size, target_ratio)
 
@@ -1644,15 +1635,24 @@ def build_output_plan(source_size: tuple[int, int], config: AppConfig) -> dict[s
         "corrected_size": corrected_size,
         "output_size": output_size,
         "canvas_processing_applied": canvas_processing_applied,
-        "preview_status_text": "内容補正 + キャンバス処理" if canvas_processing_applied else "内容補正のみ",
+        "preview_status_text": preview_status_text_for_mode(config.canvas_processing),
     }
 
 
 def render_preview_images(source_path: Path, config: AppConfig) -> tuple[Any, Any, dict[str, Any]]:
     ensure_pillow_available()
     before_image, info = load_source_image(source_path)
-    after_image, metadata = build_output_image(before_image, info, config)
-    return before_image.copy(), after_image, metadata
+    plan = build_output_plan(tuple(before_image.size), config)
+    corrected_image = before_image.resize(plan["corrected_size"], resample=get_resample_filter(config.interpolation))
+    metadata = {
+        "source_size": tuple(before_image.size),
+        "corrected_size": plan["corrected_size"],
+        "output_size": plan["output_size"],
+        "canvas_processing_applied": plan["canvas_processing_applied"],
+        "preview_status_text": plan["preview_status_text"],
+        "original_info": info,
+    }
+    return before_image.copy(), corrected_image, metadata
 
 
 def render_output_image(source_path: Path, config: AppConfig) -> tuple[Any, dict[str, Any]]:
@@ -1700,7 +1700,7 @@ def apply_canvas_processing(
     ensure_pillow_available()
     assert ImageOps is not None
 
-    if config.canvas_processing == "content_only":
+    if config.canvas_processing == "none":
         return corrected_image
     if config.canvas_processing == "original_crop":
         return ImageOps.fit(corrected_image, source_size, method=resample, centering=(0.5, 0.5))
@@ -1708,7 +1708,7 @@ def apply_canvas_processing(
     if config.canvas_processing == "original_fit":
         canvas_size = source_size
         placed_image = ImageOps.contain(corrected_image, source_size, method=resample)
-    elif config.canvas_processing == "aspect_ratio_fit":
+    elif config.canvas_processing in {"aspect_ratio_fit", "blur"}:
         target_ratio = parse_aspect_ratio(config.save_canvas_aspect_ratio)
         canvas_size = calculate_ratio_canvas_size(tuple(corrected_image.size), target_ratio)
         placed_image = corrected_image
@@ -1739,7 +1739,7 @@ def create_canvas_background(corrected_image: Any, canvas_size: tuple[int, int],
     assert ImageFilter is not None
     assert ImageOps is not None
 
-    if config.canvas_fill_mode == "color":
+    if config.canvas_processing != "blur":
         return Image.new("RGB", canvas_size, canvas_pad_color_rgb(config.canvas_pad_color))
 
     base = ImageOps.fit(corrected_image, canvas_size, method=resample, centering=(0.5, 0.5))
@@ -1801,11 +1801,10 @@ def write_report(report_path: Path | None, summary: BatchSummary, items: list[Pr
         f"対象拡張子: {', '.join(config.extensions)}",
         f"補正モード: {mode_name(config.mode)}",
         f"プリセット: {config.content_preset}",
-        f"横倍率: {config.x_scale:.4f}",
-        f"縦倍率: {config.y_scale:.4f}",
-        f"保存キャンバス処理: {canvas_processing_name(config.canvas_processing)}",
+        f"横倍率: {format_scale(config.x_scale)}",
+        f"縦倍率: {format_scale(config.y_scale)}",
+        f"キャンバス処理: {canvas_processing_name(config.canvas_processing)}",
         f"保存キャンバス比率: {config.save_canvas_aspect_ratio}",
-        f"余白の埋め方: {canvas_fill_name(config.canvas_fill_mode)}",
         f"余白色: {canvas_pad_color_name(config.canvas_pad_color)}",
         f"出力形式: {output_format_name(config.output_format)}",
         f"接尾辞: {config.suffix}",
@@ -1836,16 +1835,15 @@ def write_report(report_path: Path | None, summary: BatchSummary, items: list[Pr
                     f"状態: {item.status}",
                     f"元サイズ: {format_size(item.original_size)}",
                     f"元アスペクト比: {item.original_aspect_text}",
-                    f"内容補正後サイズ: {corrected_size_text}",
-                    f"内容補正後アスペクト比: {corrected_aspect_text}",
+                    f"倍率補正後サイズ: {corrected_size_text}",
+                    f"倍率補正後アスペクト比: {corrected_aspect_text}",
                     f"保存サイズ: {output_size_text}",
                     f"保存アスペクト比: {output_aspect_text}",
-                    f"横倍率: {config.x_scale:.4f}",
-                    f"縦倍率: {config.y_scale:.4f}",
-                    f"保存キャンバス処理: {canvas_processing_name(config.canvas_processing)}",
-                    f"余白の埋め方: {canvas_fill_name(config.canvas_fill_mode)}",
+                    f"横倍率: {format_scale(config.x_scale)}",
+                    f"縦倍率: {format_scale(config.y_scale)}",
+                    f"キャンバス処理: {canvas_processing_name(config.canvas_processing)}",
                     f"プレビュー状態: {item.canvas_status_text}",
-                    f"出力予定名: {output_name}",
+                    f"出力ファイル: {output_name}",
                     f"エラー内容: {error_text}",
                 ]
             )
@@ -1918,17 +1916,76 @@ def normalize_choice(value: str, mapping: dict[str, str], default_key: str) -> s
 
 def guess_content_preset_label(x_scale: float, y_scale: float) -> str:
     for label, preset in CONTENT_PRESET_LABELS.items():
+        if preset is None:
+            continue
         if abs(preset[0] - x_scale) < 0.0001 and abs(preset[1] - y_scale) < 0.0001:
             return label
-    return DEFAULT_CONTENT_PRESET_LABEL
+    return CUSTOM_PRESET_LABEL
+
+
+def normalize_content_preset(value: str, x_scale: float, y_scale: float) -> str:
+    if value in CONTENT_PRESET_LABELS:
+        return value
+    return guess_content_preset_label(x_scale, y_scale)
+
+
+def normalize_canvas_mode(value: str, data: dict[str, Any]) -> str:
+    aliases = {
+        "content_only": "none",
+        "none": "none",
+        "なし": "none",
+        "original_fit": "original_fit",
+        "元画像サイズに合わせる": "original_fit",
+        "元画像サイズに中央配置": "original_fit",
+        "original_crop": "original_crop",
+        "元画像サイズに中央クロップ": "original_crop",
+        "aspect_ratio_fit": "aspect_ratio_fit",
+        "16:9キャンバスに配置": "aspect_ratio_fit",
+        "保存キャンバス比率に配置": "aspect_ratio_fit",
+        "指定比率キャンバスに配置": "aspect_ratio_fit",
+        "blur_background": "blur",
+        "blur": "blur",
+        "ぼかし背景": "blur",
+    }
+    raw = value.strip()
+    mode = aliases.get(raw, "")
+    if not mode:
+        mode = aliases.get(_legacy_canvas_processing_key(data), "none")
+    legacy_fill = _safe_string(data.get("CanvasFillMode", ""))
+    if mode == "aspect_ratio_fit" and legacy_fill in {"blur", "ぼかし背景"}:
+        return "blur"
+    return mode
+
+
+def preview_status_text_for_mode(mode: str) -> str:
+    if mode == "none":
+        return "倍率補正のみ / キャンバス処理なし"
+    return f"倍率補正後 / キャンバス処理 {canvas_processing_name(mode)}"
+
+
+def build_preview_status_text(metadata: dict[str, Any], config: AppConfig) -> str:
+    lines = [
+        metadata["preview_status_text"],
+        (
+            f"元サイズ {format_size(metadata['source_size'])} / "
+            f"倍率補正後サイズ {format_size(metadata['corrected_size'])} / "
+            f"横倍率 {format_scale(config.x_scale)} / 縦倍率 {format_scale(config.y_scale)}"
+        ),
+        (
+            f"元比率 {format_ratio_text(*metadata['source_size'])} / "
+            f"倍率補正後比率 {format_ratio_text(*metadata['corrected_size'])} / "
+            f"キャンバス処理 {canvas_processing_name(config.canvas_processing)}"
+        ),
+    ]
+    if metadata.get("canvas_processing_applied"):
+        lines.append(
+            f"保存サイズ {format_size(metadata['output_size'])} / 保存比率 {format_ratio_text(*metadata['output_size'])}"
+        )
+    return WINDOWS_NEWLINE.join(lines)
 
 
 def canvas_processing_name(mode: str) -> str:
     return CANVAS_PROCESSING_LABELS.get(mode, mode)
-
-
-def canvas_fill_name(mode: str) -> str:
-    return CANVAS_FILL_LABELS.get(mode, mode)
 
 
 def canvas_pad_color_name(color_key: str) -> str:
@@ -1957,16 +2014,13 @@ def mode_name(mode: str) -> str:
 
 def _legacy_canvas_processing_key(data: dict[str, Any]) -> str:
     legacy_mode = _safe_string(data.get("OutputCanvasMode", ""))
+    if legacy_mode in {"blur_background", "ぼかし背景"}:
+        return "blur"
     if legacy_mode:
         return "aspect_ratio_fit"
-    return "content_only"
-
-
-def _legacy_canvas_fill_mode_key(data: dict[str, Any]) -> str:
-    legacy_mode = _safe_string(data.get("OutputCanvasMode", ""))
-    if legacy_mode in {"blur_background", CANVAS_FILL_LABELS.get("blur")}:
-        return "blur"
-    return "color"
+    if _safe_string(data.get("CanvasProcessing", "")) == "content_only":
+        return "none"
+    return "none"
 
 
 def _legacy_canvas_pad_color_key(data: dict[str, Any]) -> str:
@@ -2016,8 +2070,11 @@ def _clamp_int(value: int, lower: int, upper: int) -> int:
 
 
 def _format_number(value: float) -> str:
-    text = f"{value:.4f}"
-    return text.rstrip("0").rstrip(".") if "." in text else text
+    return format_scale(value)
+
+
+def format_scale(value: float) -> str:
+    return f"{value:.6f}"
 
 
 def run_headless_smoke_test() -> int:
