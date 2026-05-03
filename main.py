@@ -14,7 +14,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -101,6 +101,18 @@ REASON_LABELS = {
 }
 STOP_MESSAGE = "停止要求を受け付けました。現在のZIP処理完了後に安全停止します。"
 HEADLESS_OK_MESSAGE = "gui_ok"
+ZIP_PROGRESS_PHASES: dict[str, tuple[float, float, str]] = {
+    "extract": (0.00, 0.05, "ZIP展開中"),
+    "scan": (0.05, 0.03, "画像一覧作成中"),
+    "classify": (0.08, 0.77, "画像分類中"),
+    "contact_all": (0.85, 0.05, "contact sheet 作成中"),
+    "contact_selected": (0.90, 0.02, "selected_candidate sheet 作成中"),
+    "contact_review": (0.92, 0.02, "review sheet 作成中"),
+    "done_move": (0.94, 0.015, "done へ移動中"),
+    "report": (0.955, 0.015, "レポート作成中"),
+    "archive": (0.97, 0.025, "結果ZIP作成中"),
+    "cleanup": (0.995, 0.005, "後片付け中"),
+}
 
 if Image is not None:
     try:
@@ -281,7 +293,16 @@ class ZipBatchProcessor:
             total_zip_count=len(zip_files),
             log_file_path=self.logger.log_path,
         )
-        self.ui_sender({"kind": "progress", "value": 0.0, "maximum": max(1.0, float(len(zip_files))), "text": f"0 / {len(zip_files)} ZIP"})
+        self.ui_sender(
+            {
+                "kind": "progress",
+                "value": 0.0,
+                "maximum": max(1.0, float(len(zip_files))),
+                "text": f"0 / {len(zip_files)} ZIP | 0.0%",
+                "phase": "開始待ち",
+                "detail": "最初のZIPを待機しています",
+            }
+        )
 
         if not zip_files:
             self.logger.warning("入力フォルダに ZIP がありません。処理を終了します。")
@@ -295,6 +316,7 @@ class ZipBatchProcessor:
                 break
 
             self.ui_sender({"kind": "current_zip", "name": zip_path.name})
+            self._emit_phase_progress(zip_index, len(zip_files), "extract", 0.0, "処理を開始します")
             result = self._process_single_zip(zip_path, zip_index, len(zip_files))
             summary.processed_zip_count += 1
             if result.skipped:
@@ -308,7 +330,9 @@ class ZipBatchProcessor:
                     "kind": "progress",
                     "value": float(zip_index + 1),
                     "maximum": max(1.0, float(len(zip_files))),
-                    "text": f"{zip_index + 1} / {len(zip_files)} ZIP",
+                    "text": self._format_progress_text(zip_index + 1.0, len(zip_files)),
+                    "phase": "ZIP完了",
+                    "detail": zip_path.name,
                 }
             )
 
@@ -348,6 +372,7 @@ class ZipBatchProcessor:
         if result_dir.exists():
             if not self.config.overwrite_output:
                 self.logger.warning(f"{zip_path.name}: 出力先 {result_dir.name} が既にあるためスキップしました。")
+                self._emit_phase_progress(zip_index, total_zip_count, "cleanup", 1.0, "既存出力があるためスキップ")
                 return ZipProcessResult(
                     zip_path=zip_path,
                     zip_name=zip_path.name,
@@ -375,7 +400,10 @@ class ZipBatchProcessor:
 
         self.logger.info(f"{zip_path.name}: 処理を開始しました。")
         try:
+            self._emit_phase_progress(zip_index, total_zip_count, "extract", 0.2, "ZIP を一時フォルダへ展開しています")
             self._extract_zip(zip_path, temp_dir)
+            self._emit_phase_progress(zip_index, total_zip_count, "extract", 1.0, "ZIP 展開が完了しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "scan", 0.2, "画像ファイルを列挙しています")
             image_files = sorted(
                 (
                     path
@@ -386,6 +414,7 @@ class ZipBatchProcessor:
             )
             result.total_images = len(image_files)
             self.logger.info(f"{zip_path.name}: 画像 {len(image_files)} 枚を検出しました。")
+            self._emit_phase_progress(zip_index, total_zip_count, "scan", 1.0, f"画像 {len(image_files)} 枚を検出")
 
             for image_index, image_path in enumerate(image_files, start=1):
                 record = self._classify_image(temp_dir, image_path)
@@ -398,42 +427,95 @@ class ZipBatchProcessor:
                 else:
                     result.exclude_count += 1
 
-                progress_value = float(zip_index) + (image_index / max(1, len(image_files)))
-                self.ui_sender(
-                    {
-                        "kind": "progress",
-                        "value": progress_value,
-                        "maximum": max(1.0, float(total_zip_count)),
-                        "text": f"{zip_index + 1} / {total_zip_count} ZIP ({image_index} / {max(1, len(image_files))} 画像)",
-                    }
-                )
+                if should_emit_progress_update(image_index, len(image_files)):
+                    self._emit_phase_progress(
+                        zip_index,
+                        total_zip_count,
+                        "classify",
+                        image_index / max(1, len(image_files)),
+                        f"{image_index} / {max(1, len(image_files))} 画像",
+                    )
 
-            self._create_contact_sheet(result_dir / CONTACT_SHEET_ALL, result.records, "全画像 contact sheet")
+            selected_records = [record for record in result.records if record.category == CATEGORY_SELECTED]
+            review_records = [record for record in result.records if record.category == CATEGORY_REVIEW]
+
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 0.0, "全画像 contact sheet")
+            self._create_contact_sheet(
+                result_dir / CONTACT_SHEET_ALL,
+                result.records,
+                "全画像 contact sheet",
+                progress_callback=lambda current, total: self._emit_contact_sheet_progress(
+                    zip_index,
+                    total_zip_count,
+                    "contact_all",
+                    current,
+                    total,
+                    "全画像",
+                ),
+            )
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 1.0, "全画像 contact sheet 完了")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 0.0, "selected_candidate contact sheet")
             self._create_contact_sheet(
                 result_dir / CONTACT_SHEET_SELECTED,
-                [record for record in result.records if record.category == CATEGORY_SELECTED],
+                selected_records,
                 "selected_candidate contact sheet",
+                progress_callback=lambda current, total: self._emit_contact_sheet_progress(
+                    zip_index,
+                    total_zip_count,
+                    "contact_selected",
+                    current,
+                    total,
+                    "selected_candidate",
+                ),
             )
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 1.0, "selected_candidate contact sheet 完了")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 0.0, "review contact sheet")
             self._create_contact_sheet(
                 result_dir / CONTACT_SHEET_REVIEW,
-                [record for record in result.records if record.category == CATEGORY_REVIEW],
+                review_records,
                 "review contact sheet",
+                progress_callback=lambda current, total: self._emit_contact_sheet_progress(
+                    zip_index,
+                    total_zip_count,
+                    "contact_review",
+                    current,
+                    total,
+                    "review",
+                ),
             )
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 1.0, "review contact sheet 完了")
             result.success = True
 
             if self.config.move_done_zip:
                 try:
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 0.2, "成功した ZIP を done へ移動しています")
                     moved_path = self._move_to_done(zip_path)
                     self.logger.info(f"{zip_path.name}: 処理成功のため done へ移動しました。{moved_path.name}")
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, f"done へ移動完了: {moved_path.name}")
                 except Exception as exc:
                     error_message = f"{zip_path.name}: done への移動に失敗しました。入力フォルダに残します。{exc}"
                     result.errors.append(error_message)
                     self.logger.error(error_message)
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "done 移動失敗。入力側に残します")
             else:
                 self.logger.info(f"{zip_path.name}: done 移動は無効設定のため移動していません。")
+                self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "done 移動なし")
+            self._emit_phase_progress(zip_index, total_zip_count, "report", 0.2, "selection_report.txt を作成しています")
             self._write_selection_report(result)
-            archive_path = self._create_result_zip(result_dir, zip_path.stem)
+            self._emit_phase_progress(zip_index, total_zip_count, "report", 1.0, "selection_report.txt を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "archive", 0.0, "結果フォルダを ZIP 化しています")
+            archive_path = self._create_result_zip(
+                result_dir,
+                zip_path.stem,
+                progress_callback=lambda current, total: self._emit_archive_progress(
+                    zip_index,
+                    total_zip_count,
+                    current,
+                    total,
+                ),
+            )
             self.logger.info(f"{zip_path.name}: 結果ZIPを作成しました。{archive_path.name}")
+            self._emit_phase_progress(zip_index, total_zip_count, "archive", 1.0, f"結果ZIP作成完了: {archive_path.name}")
         except zipfile.BadZipFile as exc:
             error_message = f"{zip_path.name}: ZIP の展開に失敗しました。破損ZIPの可能性があります。{exc}"
             result.errors.append(error_message)
@@ -447,14 +529,73 @@ class ZipBatchProcessor:
             self.logger.error(traceback.format_exc().rstrip())
             self._write_selection_report(result)
         finally:
+            self._emit_phase_progress(zip_index, total_zip_count, "cleanup", 0.2, "一時フォルダを整理しています")
             if self.config.delete_temp_folder:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             result.finished_at = datetime.now()
+            self._emit_phase_progress(zip_index, total_zip_count, "cleanup", 1.0, "現在の ZIP を終了しました")
             if not result.success:
                 self.logger.warning(f"{zip_path.name}: 処理は失敗扱いで完了しました。次のZIPへ進みます。")
             else:
                 self.logger.info(f"{zip_path.name}: 処理完了。selected={result.selected_count}, review={result.review_count}, exclude={result.exclude_count}")
         return result
+
+    def _emit_phase_progress(
+        self,
+        zip_index: int,
+        total_zip_count: int,
+        phase_key: str,
+        phase_ratio: float,
+        detail: str,
+    ) -> None:
+        phase_start, phase_weight, phase_label = ZIP_PROGRESS_PHASES[phase_key]
+        normalized_ratio = max(0.0, min(1.0, phase_ratio))
+        zip_progress = phase_start + (phase_weight * normalized_ratio)
+        overall_value = float(zip_index) + zip_progress
+        self.ui_sender(
+            {
+                "kind": "progress",
+                "value": overall_value,
+                "maximum": max(1.0, float(total_zip_count)),
+                "text": self._format_progress_text(overall_value, total_zip_count),
+                "phase": phase_label,
+                "detail": detail,
+            }
+        )
+
+    def _emit_contact_sheet_progress(
+        self,
+        zip_index: int,
+        total_zip_count: int,
+        phase_key: str,
+        current: int,
+        total: int,
+        label: str,
+    ) -> None:
+        if should_emit_progress_update(current, total):
+            self._emit_phase_progress(
+                zip_index,
+                total_zip_count,
+                phase_key,
+                current / max(1, total),
+                f"{label} {current} / {max(1, total)} 枚",
+            )
+
+    def _emit_archive_progress(self, zip_index: int, total_zip_count: int, current: int, total: int) -> None:
+        if should_emit_progress_update(current, total):
+            self._emit_phase_progress(
+                zip_index,
+                total_zip_count,
+                "archive",
+                current / max(1, total),
+                f"{current} / {max(1, total)} ファイル",
+            )
+
+    def _format_progress_text(self, value: float, total_zip_count: int) -> str:
+        maximum = max(1.0, float(total_zip_count))
+        percent = min(100.0, max(0.0, (value / maximum) * 100.0))
+        completed_zip_count = min(total_zip_count, max(0, int(value)))
+        return f"完了 {completed_zip_count} / {total_zip_count} ZIP | 全体 {percent:.1f}%"
 
     def _extract_zip(self, zip_path: Path, destination_dir: Path) -> None:
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -618,7 +759,13 @@ class ZipBatchProcessor:
             error_messages.append(error_message)
             self.logger.error(error_message)
 
-    def _create_contact_sheet(self, output_path: Path, records: list[ImageRecord], title: str) -> None:
+    def _create_contact_sheet(
+        self,
+        output_path: Path,
+        records: list[ImageRecord],
+        title: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
         if Image is None or ImageDraw is None or ImageFont is None:
             return
 
@@ -640,6 +787,8 @@ class ZipBatchProcessor:
             draw.text((padding, 14), title, fill=(32, 32, 32), font=title_font)
             draw.text((padding, header_height + 20), "対象画像はありません。", fill=(80, 80, 80), font=body_font)
             save_contact_sheet(canvas, output_path)
+            if progress_callback is not None:
+                progress_callback(1, 1)
             return
 
         rows = (len(records) + columns - 1) // columns
@@ -675,6 +824,8 @@ class ZipBatchProcessor:
                 font=body_font,
                 spacing=2,
             )
+            if progress_callback is not None:
+                progress_callback(index + 1, len(records))
 
         save_contact_sheet(canvas, output_path)
 
@@ -751,16 +902,22 @@ class ZipBatchProcessor:
         with report_path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(WINDOWS_NEWLINE.join(lines) + WINDOWS_NEWLINE)
 
-    def _create_result_zip(self, result_dir: Path, original_stem: str) -> Path:
+    def _create_result_zip(
+        self,
+        result_dir: Path,
+        original_stem: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> Path:
         archive_path = result_dir / f"{sanitize_path_part(original_stem)}{RESULT_ZIP_SUFFIX}"
         if archive_path.exists():
             archive_path.unlink()
 
+        file_paths = [path for path in sorted(result_dir.rglob("*"), key=lambda item: str(item).lower()) if path != archive_path and path.is_file()]
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(result_dir.rglob("*"), key=lambda item: str(item).lower()):
-                if path == archive_path or not path.is_file():
-                    continue
+            for index, path in enumerate(file_paths, start=1):
                 archive.write(path, arcname=str(path.relative_to(result_dir)))
+                if progress_callback is not None:
+                    progress_callback(index, len(file_paths))
         return archive_path
 
     def _move_to_done(self, zip_path: Path) -> Path:
@@ -811,6 +968,7 @@ class ZipPreprocessorApp(tk.Tk):
         self.overwrite_output_var = tk.BooleanVar(value=False)
         self.copy_exclude_images_var = tk.BooleanVar(value=False)
         self.current_zip_var = tk.StringVar(value="待機中")
+        self.phase_var = tk.StringVar(value="待機中")
         self.progress_text_var = tk.StringVar(value="0 / 0 ZIP")
         self.status_var = tk.StringVar(value="待機中")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -883,6 +1041,8 @@ class ZipPreprocessorApp(tk.Tk):
         ttk.Label(status_frame, textvariable=self.current_zip_var).grid(row=0, column=1, sticky="w", padx=(10, 0))
         ttk.Label(status_frame, text="状態").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(status_frame, textvariable=self.status_var).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
+        ttk.Label(status_frame, text="工程").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.phase_var).grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
 
         progress_frame = ttk.Frame(action_group)
         progress_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -1082,9 +1242,10 @@ class ZipPreprocessorApp(tk.Tk):
         self.stop_event.clear()
         self.current_zip_var.set("開始準備中")
         self.status_var.set("処理中")
+        self.phase_var.set("開始準備中")
         self.progress_var.set(0.0)
         self.progress_bar.configure(maximum=1.0)
-        self.progress_text_var.set("0 / 0 ZIP")
+        self.progress_text_var.set("0 / 0 ZIP | 0.0%")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.save_button.configure(state="disabled")
@@ -1141,6 +1302,10 @@ class ZipPreprocessorApp(tk.Tk):
                     self.progress_bar.configure(maximum=max(1.0, maximum))
                     self.progress_var.set(value)
                     self.progress_text_var.set(str(payload.get("text", "")))
+                    phase = str(payload.get("phase", "")).strip()
+                    detail = str(payload.get("detail", "")).strip()
+                    if phase:
+                        self.phase_var.set(f"{phase} | {detail}" if detail else phase)
                 elif kind == "current_zip":
                     self.current_zip_var.set(str(payload.get("name", "")))
                 elif kind == "finish":
@@ -1184,6 +1349,7 @@ class ZipPreprocessorApp(tk.Tk):
             self.status_var.set("完了")
 
         self.current_zip_var.set("待機中")
+        self.phase_var.set("待機中")
 
     def _on_close(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
@@ -1221,6 +1387,13 @@ def _safe_bool(value: object) -> bool:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
+
+
+def should_emit_progress_update(current: int, total: int, target_updates: int = 200) -> bool:
+    if total <= 1:
+        return True
+    step = max(1, total // target_updates)
+    return current >= total or current == 1 or (current % step) == 0
 
 
 def same_path(left: Path, right: Path) -> bool:
