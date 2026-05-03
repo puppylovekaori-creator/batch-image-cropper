@@ -64,6 +64,10 @@ AFTER_COMPLETE_ACTION_LABELS = {
     "shutdown": "PCをシャットダウン",
     "sleep": "PCをスリープ",
 }
+BATCH_OUTPUT_LAYOUT_LABELS = {
+    "flat": "出力ルートへまとめて出す",
+    "per_video": "動画ごとにサブフォルダを作る",
+}
 
 TREE_COLUMNS = (
     "enabled",
@@ -133,6 +137,7 @@ class AppSettings:
     overwrite: bool = False
     use_ffmpeg_path: bool = False
     ffmpeg_path: str = "ffmpeg"
+    batch_output_layout: str = "flat"
     duplicate_subfolder_mode: str = "create_numbered_folder"
     existing_output_mode: str = "create_numbered_folder"
     prevent_sleep: bool = True
@@ -178,6 +183,11 @@ class AppSettings:
             overwrite=_safe_bool(data.get("Overwrite", False)),
             use_ffmpeg_path=_safe_bool(data.get("UseFfmpegPath", False)),
             ffmpeg_path=_safe_string(data.get("FfmpegPath", "ffmpeg")) or "ffmpeg",
+            batch_output_layout=_safe_choice(
+                data.get("BatchOutputLayout", "flat"),
+                list(BATCH_OUTPUT_LAYOUT_LABELS.keys()),
+                "flat",
+            ),
             duplicate_subfolder_mode=_safe_choice(
                 data.get("DuplicateSubfolderMode", "create_numbered_folder"),
                 list(DUPLICATE_SUBFOLDER_MODE_LABELS.keys()),
@@ -224,6 +234,7 @@ class AppSettings:
             "Overwrite": raw["overwrite"],
             "UseFfmpegPath": raw["use_ffmpeg_path"],
             "FfmpegPath": raw["ffmpeg_path"],
+            "BatchOutputLayout": raw["batch_output_layout"],
             "DuplicateSubfolderMode": raw["duplicate_subfolder_mode"],
             "ExistingOutputMode": raw["existing_output_mode"],
             "PreventSleep": raw["prevent_sleep"],
@@ -281,6 +292,7 @@ class PlannedOutput:
     output_dir: Path
     will_skip: bool = False
     will_delete: bool = False
+    delete_targets: list[Path] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -522,6 +534,8 @@ def validate_batch_settings(settings: AppSettings) -> None:
     if not settings.file_name_pattern:
         raise ValueError("出力ファイル名パターンを入力してください。")
     validate_filename_pattern(settings.file_name_pattern)
+    if settings.batch_output_layout == "flat" and "{video_name}" not in settings.file_name_pattern:
+        raise ValueError("出力ルートへまとめて出す場合は、出力ファイル名パターンに {video_name} を含めてください。")
     build_filter_expression(settings)
     if settings.use_ffmpeg_path:
         if not settings.ffmpeg_path:
@@ -773,12 +787,60 @@ def directory_has_any_output(path: Path) -> bool:
         return False
 
 
+def build_output_glob_pattern(pattern: str, video_name: str, image_format: str) -> str:
+    video_token = "__VIDEO_NAME__"
+    frame_token = "__FRAME_NO__"
+    timestamp_token = "__TIMESTAMP__"
+    stem = pattern
+    stem = stem.replace("{video_name}", video_token)
+    stem = stem.replace("{frame_no}", frame_token)
+    stem = stem.replace("{timestamp}", timestamp_token)
+    stem = sanitize_file_component(stem, "frame")
+    stem = stem.replace(video_token, sanitize_file_component(video_name, "video"))
+    stem = stem.replace(frame_token, "*")
+    stem = stem.replace(timestamp_token, "*")
+    if "*" not in stem:
+        stem = f"{stem}*"
+    return f"{stem}.{image_format}"
+
+
+def find_existing_output_files_for_video(output_root: Path, settings: AppSettings, input_path: str) -> list[Path]:
+    glob_pattern = build_output_glob_pattern(settings.file_name_pattern, Path(input_path).stem, settings.image_format)
+    if not output_root.exists():
+        return []
+    return sorted(output_root.glob(glob_pattern))
+
+
+def count_output_images_for_item(output_dir: Path, settings: AppSettings, input_path: str) -> int:
+    if settings.batch_output_layout == "flat":
+        return len(find_existing_output_files_for_video(output_dir, settings, input_path))
+    return count_output_images(output_dir, settings.image_format)
+
+
 def plan_output_directory(
     input_path: str,
     output_root: Path,
     settings: AppSettings,
     reserved: set[str],
 ) -> PlannedOutput:
+    if settings.batch_output_layout == "flat":
+        notes: list[str] = ["出力ルートへまとめて出します。"]
+        existing_files = find_existing_output_files_for_video(output_root, settings, input_path)
+        if existing_files:
+            if settings.existing_output_mode == "skip_existing":
+                notes.append("同じ動画の既存出力があるためスキップ予定です。")
+                return PlannedOutput(output_dir=output_root, will_skip=True, notes=notes)
+            if settings.existing_output_mode == "recreate_output":
+                notes.append("同じ動画の既存出力を削除して再作成します。")
+                return PlannedOutput(
+                    output_dir=output_root,
+                    will_delete=True,
+                    delete_targets=existing_files,
+                    notes=notes,
+                )
+            notes.append("同名ファイルがある場合は _001 付きで追加保存します。")
+        return PlannedOutput(output_dir=output_root, notes=notes)
+
     base_dir_name = sanitize_file_component(f"{Path(input_path).stem}_frames", "video_frames")
     base_path = output_root / base_dir_name
     notes: list[str] = []
@@ -810,7 +872,13 @@ def plan_output_directory(
         elif settings.existing_output_mode == "recreate_output":
             notes.append("既存出力を削除して再作成します。")
             reserved.add(candidate_key)
-            return PlannedOutput(output_dir=candidate, will_skip=False, will_delete=True, notes=notes)
+            return PlannedOutput(
+                output_dir=candidate,
+                will_skip=False,
+                will_delete=True,
+                delete_targets=[candidate],
+                notes=notes,
+            )
 
     reserved.add(candidate_key)
     return PlannedOutput(output_dir=candidate, will_skip=False, will_delete=False, notes=notes)
@@ -884,6 +952,18 @@ def build_output_file_stem(
     return sanitize_file_component(stem, "frame")
 
 
+def build_temp_file_prefix(video_name: str) -> str:
+    return f"__ffextract_tmp_{sanitize_file_component(video_name, 'video')}_"
+
+
+def build_temp_output_pattern(output_dir: Path, settings: AppSettings, video_name: str) -> str:
+    return str(output_dir / f"{build_temp_file_prefix(video_name)}%0{settings.digits}d.{settings.image_format}")
+
+
+def find_temp_output_files(output_dir: Path, settings: AppSettings, video_name: str) -> list[Path]:
+    return sorted(output_dir.glob(f"{build_temp_file_prefix(video_name)}*.{settings.image_format}"))
+
+
 def unique_file_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -903,8 +983,7 @@ def rename_extracted_files(
     video_name: str,
     fps: float | None,
 ) -> int:
-    pattern = f"__ffextract_tmp_*.{settings.image_format}"
-    files = sorted(output_dir.glob(pattern))
+    files = find_temp_output_files(output_dir, settings, video_name)
     count = 0
     for index, file_path in enumerate(files, start=1):
         timestamp_seconds = compute_frame_timestamp_seconds(index, settings, fps)
@@ -1063,6 +1142,7 @@ class FfmpegFrameExtractCommandGui:
         self.overwrite_var = tk.BooleanVar(value=False)
         self.use_ffmpeg_path_var = tk.BooleanVar(value=False)
         self.ffmpeg_path_var = tk.StringVar(value="ffmpeg")
+        self.batch_output_layout_var = tk.StringVar(value=BATCH_OUTPUT_LAYOUT_LABELS["flat"])
         self.duplicate_subfolder_mode_var = tk.StringVar(value=DUPLICATE_SUBFOLDER_MODE_LABELS["create_numbered_folder"])
         self.existing_output_mode_var = tk.StringVar(value=EXISTING_OUTPUT_MODE_LABELS["create_numbered_folder"])
         self.prevent_sleep_var = tk.BooleanVar(value=True)
@@ -1084,6 +1164,9 @@ class FfmpegFrameExtractCommandGui:
         self.custom_seconds_spinbox: ttk.Spinbox
         self.resize_width_spinbox: ttk.Spinbox
         self.resize_height_spinbox: ttk.Spinbox
+        self.file_name_pattern_entry: ttk.Entry
+        self.batch_output_layout_combo: ttk.Combobox
+        self.duplicate_subfolder_mode_combo: ttk.Combobox
         self.ffmpeg_path_entry: ttk.Entry
         self.ffmpeg_browse_button: ttk.Button
         self.pause_button: ttk.Button
@@ -1202,10 +1285,11 @@ class FfmpegFrameExtractCommandGui:
         ttk.Label(settings_group, text="既存の単発コマンド生成に使います。").grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
 
         ttk.Label(settings_group, text="出力ファイル名パターン").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Entry(settings_group, textvariable=self.file_name_pattern_var).grid(row=4, column=1, sticky="ew", padx=(10, 8), pady=4)
+        self.file_name_pattern_entry = ttk.Entry(settings_group, textvariable=self.file_name_pattern_var)
+        self.file_name_pattern_entry.grid(row=4, column=1, sticky="ew", padx=(10, 8), pady=4)
         ttk.Label(
             settings_group,
-            text="例: {video_name}_{frame_no} / {video_name}_{timestamp}_{frame_no}",
+            text="例: {video_name}_{frame_no} / {video_name}_{timestamp}_{frame_no} / まとめて出す時は {video_name} を含めます。",
         ).grid(row=4, column=2, columnspan=2, sticky="w", pady=4)
 
         digits_row = ttk.Frame(settings_group)
@@ -1257,16 +1341,17 @@ class FfmpegFrameExtractCommandGui:
         self.resize_height_spinbox.pack(side="left")
         ttk.Checkbutton(resize_row, text="アスペクト比を維持する", variable=self.keep_aspect_var).pack(side="left", padx=(16, 0))
 
-        duplicate_row = ttk.Frame(settings_group)
-        duplicate_row.grid(row=8, column=1, sticky="ew", padx=(10, 8), pady=4)
-        ttk.Label(settings_group, text="サブフォルダ重複時").grid(row=8, column=0, sticky="w", pady=4)
-        ttk.Combobox(
-            duplicate_row,
+        layout_row = ttk.Frame(settings_group)
+        layout_row.grid(row=8, column=1, sticky="ew", padx=(10, 8), pady=4)
+        ttk.Label(settings_group, text="バッチ出力方法").grid(row=8, column=0, sticky="w", pady=4)
+        self.batch_output_layout_combo = ttk.Combobox(
+            layout_row,
             width=28,
             state="readonly",
-            values=list(DUPLICATE_SUBFOLDER_MODE_LABELS.values()),
-            textvariable=self.duplicate_subfolder_mode_var,
-        ).pack(side="left")
+            values=list(BATCH_OUTPUT_LAYOUT_LABELS.values()),
+            textvariable=self.batch_output_layout_var,
+        )
+        self.batch_output_layout_combo.pack(side="left")
 
         existing_row = ttk.Frame(settings_group)
         existing_row.grid(row=8, column=2, columnspan=2, sticky="ew", pady=4)
@@ -1279,17 +1364,33 @@ class FfmpegFrameExtractCommandGui:
             textvariable=self.existing_output_mode_var,
         ).pack(side="left", padx=(8, 0))
 
+        duplicate_row = ttk.Frame(settings_group)
+        duplicate_row.grid(row=9, column=1, sticky="ew", padx=(10, 8), pady=4)
+        ttk.Label(settings_group, text="サブフォルダ重複時").grid(row=9, column=0, sticky="w", pady=4)
+        self.duplicate_subfolder_mode_combo = ttk.Combobox(
+            duplicate_row,
+            width=28,
+            state="readonly",
+            values=list(DUPLICATE_SUBFOLDER_MODE_LABELS.values()),
+            textvariable=self.duplicate_subfolder_mode_var,
+        )
+        self.duplicate_subfolder_mode_combo.pack(side="left")
+        ttk.Label(
+            duplicate_row,
+            text="動画ごとサブフォルダを作る時だけ使います。",
+        ).pack(side="left", padx=(8, 0))
+
         options_row = ttk.Frame(settings_group)
-        options_row.grid(row=9, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=4)
-        ttk.Label(settings_group, text="オプション").grid(row=9, column=0, sticky="nw", pady=4)
+        options_row.grid(row=10, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=4)
+        ttk.Label(settings_group, text="オプション").grid(row=10, column=0, sticky="nw", pady=4)
         ttk.Checkbutton(options_row, text="出力フォルダ作成コマンドを付ける", variable=self.include_mkdir_var).pack(side="left")
         ttk.Checkbutton(options_row, text="上書き -y を付ける", variable=self.overwrite_var).pack(side="left", padx=(16, 0))
         ttk.Checkbutton(options_row, text="実行中は PC スリープを抑止する", variable=self.prevent_sleep_var).pack(side="left", padx=(16, 0))
 
         ffmpeg_row = ttk.Frame(settings_group)
-        ffmpeg_row.grid(row=10, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=4)
+        ffmpeg_row.grid(row=11, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=4)
         ffmpeg_row.columnconfigure(1, weight=1)
-        ttk.Label(settings_group, text="ffmpeg パス").grid(row=10, column=0, sticky="w", pady=4)
+        ttk.Label(settings_group, text="ffmpeg パス").grid(row=11, column=0, sticky="w", pady=4)
         ttk.Checkbutton(ffmpeg_row, text="ffmpeg.exe のフルパスを指定する", variable=self.use_ffmpeg_path_var).grid(row=0, column=0, sticky="w")
         self.ffmpeg_path_entry = ttk.Entry(ffmpeg_row, textvariable=self.ffmpeg_path_var)
         self.ffmpeg_path_entry.grid(row=0, column=1, sticky="ew", padx=(10, 8))
@@ -1297,8 +1398,8 @@ class FfmpegFrameExtractCommandGui:
         self.ffmpeg_browse_button.grid(row=0, column=2, sticky="ew")
 
         after_action_row = ttk.Frame(settings_group)
-        after_action_row.grid(row=11, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=4)
-        ttk.Label(settings_group, text="完了後アクション").grid(row=11, column=0, sticky="w", pady=4)
+        after_action_row.grid(row=12, column=1, columnspan=3, sticky="w", padx=(10, 0), pady=4)
+        ttk.Label(settings_group, text="完了後アクション").grid(row=12, column=0, sticky="w", pady=4)
         ttk.Combobox(
             after_action_row,
             width=24,
@@ -1410,6 +1511,7 @@ class FfmpegFrameExtractCommandGui:
             self.ffmpeg_path_var,
             self.output_root_var,
             self.file_name_pattern_var,
+            self.batch_output_layout_var,
             self.duplicate_subfolder_mode_var,
             self.existing_output_mode_var,
         ]
@@ -1442,6 +1544,7 @@ class FfmpegFrameExtractCommandGui:
         self.overwrite_var.set(settings.overwrite)
         self.use_ffmpeg_path_var.set(settings.use_ffmpeg_path)
         self.ffmpeg_path_var.set(settings.ffmpeg_path)
+        self.batch_output_layout_var.set(self._mode_label(settings.batch_output_layout, BATCH_OUTPUT_LAYOUT_LABELS))
         self.duplicate_subfolder_mode_var.set(self._mode_label(settings.duplicate_subfolder_mode, DUPLICATE_SUBFOLDER_MODE_LABELS))
         self.existing_output_mode_var.set(self._mode_label(settings.existing_output_mode, EXISTING_OUTPUT_MODE_LABELS))
         self.prevent_sleep_var.set(settings.prevent_sleep)
@@ -1473,6 +1576,7 @@ class FfmpegFrameExtractCommandGui:
             overwrite=self.overwrite_var.get(),
             use_ffmpeg_path=self.use_ffmpeg_path_var.get(),
             ffmpeg_path=self.ffmpeg_path_var.get().strip(),
+            batch_output_layout=self._mode_key(self.batch_output_layout_var.get(), BATCH_OUTPUT_LAYOUT_LABELS),
             duplicate_subfolder_mode=self._mode_key(self.duplicate_subfolder_mode_var.get(), DUPLICATE_SUBFOLDER_MODE_LABELS),
             existing_output_mode=self._mode_key(self.existing_output_mode_var.get(), EXISTING_OUTPUT_MODE_LABELS),
             prevent_sleep=self.prevent_sleep_var.get(),
@@ -1511,10 +1615,13 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_tree()
 
     def update_option_states(self) -> None:
+        settings = self.collect_settings()
+        is_flat_output = settings.batch_output_layout == "flat"
         jpeg_state = "normal" if self.image_format_var.get() == "jpg" else "disabled"
         custom_state = "normal" if self.extract_mode_var.get() == "指定秒ごと" else "disabled"
         ffmpeg_state = "normal" if self.use_ffmpeg_path_var.get() else "disabled"
         resize_state = "normal" if self.resize_enabled_var.get() else "disabled"
+        duplicate_state = "disabled" if is_flat_output else "readonly"
 
         self.jpeg_quality_spinbox.configure(state=jpeg_state)
         self.custom_seconds_spinbox.configure(state=custom_state)
@@ -1522,6 +1629,7 @@ class FfmpegFrameExtractCommandGui:
         self.ffmpeg_browse_button.configure(state=ffmpeg_state)
         self.resize_width_spinbox.configure(state=resize_state)
         self.resize_height_spinbox.configure(state=resize_state)
+        self.duplicate_subfolder_mode_combo.configure(state=duplicate_state)
 
     def update_preview(self) -> None:
         settings = self.collect_settings()
@@ -1622,7 +1730,26 @@ class FfmpegFrameExtractCommandGui:
         self._add_paths_to_queue(paths)
 
     def _handle_dropped_paths(self, raw_paths: list[str]) -> None:
-        self.root.after(0, lambda: self._add_paths_to_queue(raw_paths))
+        def handler() -> None:
+            if self.queue_items:
+                choice = messagebox.askyesnocancel(
+                    "ドラッグ＆ドロップ追加",
+                    "既存の動画キューがあります。\n\n"
+                    "はい: 一覧をクリアして入れ替える\n"
+                    "いいえ: 後ろに追加する\n"
+                    "キャンセル: 何もしない",
+                    parent=self.root,
+                )
+                if choice is None:
+                    self.status_var.set("ドラッグ＆ドロップ追加を中止しました。")
+                    return
+                if choice:
+                    self.queue_items.clear()
+                    self._refresh_queue_tree()
+                    self.status_var.set("動画キューをクリアしてから追加します。")
+            self._add_paths_to_queue(raw_paths)
+
+        self.root.after(0, handler)
 
     def _add_paths_to_queue(self, raw_paths: list[str]) -> None:
         expanded_paths: list[str] = []
@@ -1933,6 +2060,7 @@ class FfmpegFrameExtractCommandGui:
             f"FFmpeg 確認: {ffmpeg_message}",
             f"ffprobe 確認: {ffprobe_path or '見つかりません。長さ取得不可の動画は推定枚数が空欄になります。'}",
             f"出力ルート確認: {output_message}",
+            f"バッチ出力方法: {self._mode_label(settings.batch_output_layout, BATCH_OUTPUT_LAYOUT_LABELS)}",
             f"既存出力の扱い: {self._mode_label(settings.existing_output_mode, EXISTING_OUTPUT_MODE_LABELS)}",
             f"サブフォルダ重複時: {self._mode_label(settings.duplicate_subfolder_mode, DUPLICATE_SUBFOLDER_MODE_LABELS)}",
             "",
@@ -2013,15 +2141,18 @@ class FfmpegFrameExtractCommandGui:
             delete_targets: list[str] = []
             for item in selected_items:
                 plan = plan_output_directory(item.input_path, Path(settings.output_root), settings, preview_reserved)
-                if plan.will_delete and directory_has_any_output(plan.output_dir):
-                    delete_targets.append(str(plan.output_dir))
+                if plan.will_delete:
+                    if plan.delete_targets:
+                        delete_targets.extend(str(target) for target in plan.delete_targets)
+                    elif directory_has_any_output(plan.output_dir):
+                        delete_targets.append(str(plan.output_dir))
             if delete_targets:
                 preview_text = WINDOWS_NEWLINE.join(delete_targets[:10])
                 if len(delete_targets) > 10:
                     preview_text += WINDOWS_NEWLINE + f"... 他 {len(delete_targets) - 10} 件"
                 proceed = messagebox.askyesno(
                     "削除確認",
-                    "既存出力を削除して作り直す設定です。次のフォルダを削除して再作成します。\n\n"
+                    "既存出力を削除して作り直す設定です。次の出力を削除して再作成します。\n\n"
                     f"{preview_text}\n\n続行しますか？",
                     parent=self.root,
                 )
@@ -2200,7 +2331,7 @@ class FfmpegFrameExtractCommandGui:
                 if plan.will_skip:
                     processed += 1
                     skip_count += 1
-                    output_count = count_output_images(output_dir, settings.image_format)
+                    output_count = count_output_images_for_item(output_dir, settings, worker_item.input_path)
                     total_output_count += output_count
                     self.ui_queue.put(
                         (
@@ -2236,8 +2367,12 @@ class FfmpegFrameExtractCommandGui:
 
                 try:
                     output_dir.mkdir(parents=True, exist_ok=True)
-                    if plan.will_delete and output_dir.exists():
-                        shutil.rmtree(output_dir)
+                    if plan.will_delete:
+                        for target in plan.delete_targets or [output_dir]:
+                            if target.is_dir():
+                                shutil.rmtree(target, ignore_errors=False)
+                            elif target.exists():
+                                target.unlink()
                         output_dir.mkdir(parents=True, exist_ok=True)
                 except Exception as exc:
                     processed += 1
@@ -2275,7 +2410,15 @@ class FfmpegFrameExtractCommandGui:
                     self.ui_queue.put(("overall_progress", {"processed": processed, "total": len(selected_items), "output_count": total_output_count}))
                     continue
 
-                temp_pattern = str(output_dir / f"__ffextract_tmp_%0{settings.digits}d.{settings.image_format}")
+                existing_output_count = count_output_images_for_item(output_dir, settings, worker_item.input_path)
+                temp_files = find_temp_output_files(output_dir, settings, Path(worker_item.input_path).stem)
+                for temp_file in temp_files:
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
+
+                temp_pattern = build_temp_output_pattern(output_dir, settings, Path(worker_item.input_path).stem)
                 ffmpeg_args = build_batch_ffmpeg_args(settings, ffmpeg_path, worker_item.input_path, temp_pattern)
                 command_line = render_commandline(ffmpeg_args)
                 self.ui_queue.put(
@@ -2301,7 +2444,7 @@ class FfmpegFrameExtractCommandGui:
                 if self.cancel_event.is_set():
                     cancelled = True
                     try:
-                        for temp_file in output_dir.glob(f"__ffextract_tmp_*.{settings.image_format}"):
+                        for temp_file in find_temp_output_files(output_dir, settings, Path(worker_item.input_path).stem):
                             temp_file.unlink(missing_ok=True)
                     except Exception:
                         pass
@@ -2340,11 +2483,17 @@ class FfmpegFrameExtractCommandGui:
                     try:
                         actual_count = rename_extracted_files(output_dir, settings, Path(worker_item.input_path).stem, worker_item.fps)
                     except Exception as exc:
-                        actual_count = count_output_images(output_dir, settings.image_format)
+                        actual_after_rename = count_output_images_for_item(output_dir, settings, worker_item.input_path)
+                        actual_count = max(0, actual_after_rename - existing_output_count)
                         exit_code = 9001
                         error_lines.append(f"リネーム処理に失敗しました: {exc}")
                 else:
-                    actual_count = count_output_images(output_dir, settings.image_format)
+                    actual_count = 0
+                    try:
+                        for temp_file in find_temp_output_files(output_dir, settings, Path(worker_item.input_path).stem):
+                            temp_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 processed += 1
                 total_output_count += actual_count
@@ -2630,7 +2779,9 @@ class FfmpegFrameExtractCommandGui:
                 "resize_height": settings.resize_height,
                 "keep_aspect": settings.keep_aspect,
                 "file_name_pattern": settings.file_name_pattern,
+                "batch_output_layout": settings.batch_output_layout,
                 "existing_output_mode": settings.existing_output_mode,
+                "duplicate_subfolder_mode": settings.duplicate_subfolder_mode,
                 "prevent_sleep": settings.prevent_sleep,
                 "after_complete_action": settings.after_complete_action,
             },
@@ -2906,6 +3057,7 @@ class FfmpegFrameExtractCommandGui:
                 "resize_height": settings.resize_height,
                 "keep_aspect": settings.keep_aspect,
                 "file_name_pattern": settings.file_name_pattern,
+                "batch_output_layout": settings.batch_output_layout,
                 "existing_output_mode": settings.existing_output_mode,
                 "duplicate_subfolder_mode": settings.duplicate_subfolder_mode,
                 "prevent_sleep": settings.prevent_sleep,
@@ -2957,6 +3109,11 @@ class FfmpegFrameExtractCommandGui:
         current.resize_height = max(0, _safe_int(settings_data.get("resize_height", current.resize_height), current.resize_height))
         current.keep_aspect = _safe_bool(settings_data.get("keep_aspect", current.keep_aspect))
         current.file_name_pattern = _safe_string(settings_data.get("file_name_pattern", current.file_name_pattern)) or current.file_name_pattern
+        current.batch_output_layout = _safe_choice(
+            settings_data.get("batch_output_layout", current.batch_output_layout),
+            list(BATCH_OUTPUT_LAYOUT_LABELS.keys()),
+            current.batch_output_layout,
+        )
         current.existing_output_mode = _safe_choice(
             settings_data.get("existing_output_mode", current.existing_output_mode),
             list(EXISTING_OUTPUT_MODE_LABELS.keys()),
