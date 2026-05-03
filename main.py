@@ -59,6 +59,10 @@ REPORT_FILE_NAME = "selection_report.txt"
 CONTACT_SHEET_ALL = "contact_sheet_all.jpg"
 CONTACT_SHEET_SELECTED = "contact_sheet_selected_candidate.jpg"
 CONTACT_SHEET_REVIEW = "contact_sheet_review.jpg"
+CONTACT_SHEET_PART_TEMPLATE = "{stem}_part{page:03d}{suffix}"
+CONTACT_SHEET_MAX_PAGE_WIDTH = 16000
+CONTACT_SHEET_MAX_PAGE_HEIGHT = 16000
+CONTACT_SHEET_MAX_PAGE_PIXELS = 64_000_000
 RESULT_ZIP_SUFFIX = "_result.zip"
 CATEGORY_SELECTED = "selected_candidate"
 CATEGORY_REVIEW = "review"
@@ -440,10 +444,12 @@ class ZipBatchProcessor:
             review_records = [record for record in result.records if record.category == CATEGORY_REVIEW]
 
             self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 0.0, "全画像 contact sheet")
-            self._create_contact_sheet(
-                result_dir / CONTACT_SHEET_ALL,
-                result.records,
-                "全画像 contact sheet",
+            self._create_contact_sheet_safe(
+                zip_name=zip_path.name,
+                result_errors=result.errors,
+                output_path=result_dir / CONTACT_SHEET_ALL,
+                records=result.records,
+                title="全画像 contact sheet",
                 progress_callback=lambda current, total: self._emit_contact_sheet_progress(
                     zip_index,
                     total_zip_count,
@@ -455,10 +461,12 @@ class ZipBatchProcessor:
             )
             self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 1.0, "全画像 contact sheet 完了")
             self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 0.0, "selected_candidate contact sheet")
-            self._create_contact_sheet(
-                result_dir / CONTACT_SHEET_SELECTED,
-                selected_records,
-                "selected_candidate contact sheet",
+            self._create_contact_sheet_safe(
+                zip_name=zip_path.name,
+                result_errors=result.errors,
+                output_path=result_dir / CONTACT_SHEET_SELECTED,
+                records=selected_records,
+                title="selected_candidate contact sheet",
                 progress_callback=lambda current, total: self._emit_contact_sheet_progress(
                     zip_index,
                     total_zip_count,
@@ -470,10 +478,12 @@ class ZipBatchProcessor:
             )
             self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 1.0, "selected_candidate contact sheet 完了")
             self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 0.0, "review contact sheet")
-            self._create_contact_sheet(
-                result_dir / CONTACT_SHEET_REVIEW,
-                review_records,
-                "review contact sheet",
+            self._create_contact_sheet_safe(
+                zip_name=zip_path.name,
+                result_errors=result.errors,
+                output_path=result_dir / CONTACT_SHEET_REVIEW,
+                records=review_records,
+                title="review contact sheet",
                 progress_callback=lambda current, total: self._emit_contact_sheet_progress(
                     zip_index,
                     total_zip_count,
@@ -765,9 +775,9 @@ class ZipBatchProcessor:
         records: list[ImageRecord],
         title: str,
         progress_callback: Callable[[int, int], None] | None = None,
-    ) -> None:
+    ) -> list[Path]:
         if Image is None or ImageDraw is None or ImageFont is None:
-            return
+            return []
 
         columns = max(1, self.config.contact_sheet_columns)
         thumb_width = max(120, self.config.thumbnail_width)
@@ -780,6 +790,11 @@ class ZipBatchProcessor:
 
         title_font = load_contact_font(20)
         body_font = load_contact_font(14)
+        effective_columns = min(columns, max(1, CONTACT_SHEET_MAX_PAGE_WIDTH // max(1, tile_width)))
+        if effective_columns < columns:
+            self.logger.warning(
+                f"{output_path.name}: 幅が大きすぎるため、contact sheet 列数を {columns} から {effective_columns} に調整しました。"
+            )
 
         if not records:
             canvas = Image.new("RGB", (tile_width, header_height + tile_height), color=(245, 245, 245))
@@ -789,45 +804,89 @@ class ZipBatchProcessor:
             save_contact_sheet(canvas, output_path)
             if progress_callback is not None:
                 progress_callback(1, 1)
-            return
+            return [output_path]
 
-        rows = (len(records) + columns - 1) // columns
-        canvas_width = columns * tile_width
-        canvas_height = header_height + rows * tile_height
-        canvas = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
-        draw = ImageDraw.Draw(canvas)
-        draw.text((padding, 14), title, fill=(32, 32, 32), font=title_font)
-
-        for index, record in enumerate(records):
-            row = index // columns
-            column = index % columns
-            tile_left = column * tile_width
-            tile_top = header_height + row * tile_height
-            image_left = tile_left + padding
-            image_top = tile_top + padding
-            tile_box = (tile_left + 6, tile_top + 6, tile_left + tile_width - 6, tile_top + tile_height - 6)
-            draw.rounded_rectangle(tile_box, radius=8, outline=CATEGORY_BORDER_COLORS.get(record.category, (130, 130, 130)), width=3, fill=(255, 255, 255))
-
-            thumbnail = make_thumbnail_image(record.source_path, thumb_width, thumb_height)
-            canvas.paste(thumbnail, (image_left, image_top))
-
-            caption_path = trim_middle(Path(record.relative_path).name, 28)
-            caption_reason = trim_middle(record.short_reason_text, 28)
-            caption_text = f"{caption_path}\n{caption_reason}"
-            wrapped_lines: list[str] = []
-            for caption_line in caption_text.splitlines():
-                wrapped_lines.extend(textwrap.wrap(caption_line, width=max(8, thumb_width // 11)) or [""])
-            draw.multiline_text(
-                (image_left, image_top + thumb_height + 8),
-                "\n".join(wrapped_lines[:4]),
-                fill=(40, 40, 40),
-                font=body_font,
-                spacing=2,
+        max_rows_by_height = max(1, (CONTACT_SHEET_MAX_PAGE_HEIGHT - header_height) // max(1, tile_height))
+        page_canvas_width = effective_columns * tile_width
+        max_rows_by_pixels = max(1, CONTACT_SHEET_MAX_PAGE_PIXELS // max(1, page_canvas_width * tile_height))
+        rows_per_page = max(1, min(max_rows_by_height, max_rows_by_pixels))
+        records_per_page = max(1, effective_columns * rows_per_page)
+        page_count = (len(records) + records_per_page - 1) // records_per_page
+        if page_count > 1:
+            self.logger.warning(
+                f"{output_path.name}: 画像 {len(records)} 枚のため、contact sheet を {page_count} 分割で出力します。"
             )
-            if progress_callback is not None:
-                progress_callback(index + 1, len(records))
 
-        save_contact_sheet(canvas, output_path)
+        output_paths: list[Path] = []
+        for page_index in range(page_count):
+            page_records = records[page_index * records_per_page : (page_index + 1) * records_per_page]
+            page_rows = (len(page_records) + effective_columns - 1) // effective_columns
+            canvas_width = effective_columns * tile_width
+            canvas_height = header_height + page_rows * tile_height
+            canvas = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
+            draw = ImageDraw.Draw(canvas)
+            page_title = title if page_count == 1 else f"{title} ({page_index + 1}/{page_count})"
+            draw.text((padding, 14), page_title, fill=(32, 32, 32), font=title_font)
+
+            for record_index, record in enumerate(page_records):
+                row = record_index // effective_columns
+                column = record_index % effective_columns
+                tile_left = column * tile_width
+                tile_top = header_height + row * tile_height
+                image_left = tile_left + padding
+                image_top = tile_top + padding
+                tile_box = (tile_left + 6, tile_top + 6, tile_left + tile_width - 6, tile_top + tile_height - 6)
+                draw.rounded_rectangle(tile_box, radius=8, outline=CATEGORY_BORDER_COLORS.get(record.category, (130, 130, 130)), width=3, fill=(255, 255, 255))
+
+                thumbnail = make_thumbnail_image(record.source_path, thumb_width, thumb_height)
+                canvas.paste(thumbnail, (image_left, image_top))
+
+                caption_path = trim_middle(Path(record.relative_path).name, 28)
+                caption_reason = trim_middle(record.short_reason_text, 28)
+                caption_text = f"{caption_path}\n{caption_reason}"
+                wrapped_lines: list[str] = []
+                for caption_line in caption_text.splitlines():
+                    wrapped_lines.extend(textwrap.wrap(caption_line, width=max(8, thumb_width // 11)) or [""])
+                draw.multiline_text(
+                    (image_left, image_top + thumb_height + 8),
+                    "\n".join(wrapped_lines[:4]),
+                    fill=(40, 40, 40),
+                    font=body_font,
+                    spacing=2,
+                )
+                if progress_callback is not None:
+                    progress_callback((page_index * records_per_page) + record_index + 1, len(records))
+
+            page_output_path = output_path if page_index == 0 else output_path.with_name(
+                CONTACT_SHEET_PART_TEMPLATE.format(
+                    stem=output_path.stem,
+                    page=page_index + 1,
+                    suffix=output_path.suffix,
+                )
+            )
+            save_contact_sheet(canvas, page_output_path)
+            output_paths.append(page_output_path)
+        return output_paths
+
+    def _create_contact_sheet_safe(
+        self,
+        zip_name: str,
+        result_errors: list[str],
+        output_path: Path,
+        records: list[ImageRecord],
+        title: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
+        try:
+            self._create_contact_sheet(output_path, records, title, progress_callback=progress_callback)
+        except Exception as exc:
+            error_message = f"{zip_name}: {output_path.name} の作成に失敗しました。{exc}"
+            result_errors.append(error_message)
+            self.logger.error(error_message)
+            try:
+                write_contact_sheet_error_notice(output_path, title, str(exc))
+            except Exception as notice_exc:
+                self.logger.error(f"{zip_name}: contact sheet エラー通知画像の作成にも失敗しました。{notice_exc}")
 
     def _write_selection_report(self, result: ZipProcessResult) -> None:
         report_path = result.result_dir / REPORT_FILE_NAME
@@ -1540,6 +1599,21 @@ def make_thumbnail_image(image_path: Path, thumb_width: int, thumb_height: int) 
 def save_contact_sheet(image: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path, format="JPEG", quality=92, subsampling=0)
+
+
+def write_contact_sheet_error_notice(output_path: Path, title: str, error_message: str) -> None:
+    if Image is None or ImageDraw is None or ImageFont is None:
+        return
+    width = 1280
+    height = 240
+    canvas = Image.new("RGB", (width, height), color=(250, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+    title_font = load_contact_font(22)
+    body_font = load_contact_font(16)
+    draw.text((24, 20), f"{title} の作成に失敗しました", fill=(160, 30, 30), font=title_font)
+    lines = textwrap.wrap(error_message, width=88) or ["unknown error"]
+    draw.multiline_text((24, 70), "\n".join(lines[:6]), fill=(60, 60, 60), font=body_font, spacing=4)
+    save_contact_sheet(canvas, output_path)
 
 
 def trim_middle(text: str, max_length: int) -> str:

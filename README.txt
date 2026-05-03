@@ -165,8 +165,12 @@ OutputFolder\
     contact_sheet_all.jpg
     contact_sheet_selected_candidate.jpg
     contact_sheet_review.jpg
+    contact_sheet_all_part002.jpg  など
     selection_report.txt
     kaori_009_result.zip
+
+補足:
+- contact sheet が大きくなりすぎる場合は、`contact_sheet_all_part002.jpg` のように自動分割されます。
 
 selection_report.txt には次を出力します。
 - 元ZIP名
