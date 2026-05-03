@@ -281,6 +281,7 @@ class FfmpegFrameExtractCommandGui:
         self._apply_settings(load_settings())
         self.update_option_states()
         self.update_preview()
+        self._install_context_menus()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -588,7 +589,7 @@ class FfmpegFrameExtractCommandGui:
         proceed = messagebox.askyesno(
             "実行確認",
             "生成されたコマンドを PowerShell で実行します。\n"
-            "別ウィンドウで ffmpeg の進行状況が表示されます。\n\n"
+            "別ウィンドウで ffmpeg の進行状況が表示され、完了後は自動で閉じます。\n\n"
             "続行しますか？",
             parent=self.root,
         )
@@ -599,7 +600,7 @@ class FfmpegFrameExtractCommandGui:
             subprocess.Popen(
                 [
                     "powershell.exe",
-                    "-NoExit",
+                    "-NoProfile",
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
@@ -611,6 +612,90 @@ class FfmpegFrameExtractCommandGui:
             return
 
         self.status_var.set("PowerShell を起動しました。")
+
+    def _install_context_menus(self) -> None:
+        self.root.bind_class("Entry", "<Button-3>", self._show_entry_context_menu, add="+")
+        self.root.bind_class("TEntry", "<Button-3>", self._show_entry_context_menu, add="+")
+        self.root.bind_class("TCombobox", "<Button-3>", self._show_entry_context_menu, add="+")
+        self.root.bind_class("TSpinbox", "<Button-3>", self._show_entry_context_menu, add="+")
+        self.root.bind_class("Text", "<Button-3>", self._show_text_context_menu, add="+")
+
+    def _show_entry_context_menu(self, event: tk.Event) -> str:
+        widget = event.widget
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="切り取り", command=lambda w=widget: self._entry_cut(w))
+        menu.add_command(label="コピー", command=lambda w=widget: self._entry_copy(w))
+        menu.add_command(label="貼り付け", command=lambda w=widget: self._entry_paste(w))
+        menu.add_separator()
+        menu.add_command(label="すべて選択", command=lambda w=widget: self._entry_select_all(w))
+        self._popup_menu(menu, event)
+        return "break"
+
+    def _show_text_context_menu(self, event: tk.Event) -> str:
+        widget = event.widget
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="コピー", command=lambda w=widget: self._text_copy(w))
+        menu.add_separator()
+        menu.add_command(label="すべて選択", command=lambda w=widget: self._text_select_all(w))
+        self._popup_menu(menu, event)
+        return "break"
+
+    def _popup_menu(self, menu: tk.Menu, event: tk.Event) -> None:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _entry_cut(self, widget: tk.Widget) -> None:
+        try:
+            selected = widget.selection_get()
+        except tk.TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
+        widget.delete("sel.first", "sel.last")
+
+    def _entry_copy(self, widget: tk.Widget) -> None:
+        try:
+            selected = widget.selection_get()
+        except tk.TclError:
+            selected = widget.get()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
+
+    def _entry_paste(self, widget: tk.Widget) -> None:
+        try:
+            paste_text = self.root.clipboard_get()
+        except tk.TclError:
+            return
+        try:
+            widget.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        insert_index = widget.index("insert")
+        widget.insert(insert_index, paste_text)
+
+    def _entry_select_all(self, widget: tk.Widget) -> None:
+        widget.focus_set()
+        try:
+            widget.selection_range(0, tk.END)
+            widget.icursor(tk.END)
+        except tk.TclError:
+            pass
+
+    def _text_copy(self, widget: tk.Text) -> None:
+        try:
+            selected = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = widget.get("1.0", tk.END).rstrip()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
+
+    def _text_select_all(self, widget: tk.Text) -> None:
+        widget.focus_set()
+        widget.tag_add("sel", "1.0", tk.END)
+        widget.mark_set("insert", "1.0")
+        widget.see("insert")
 
     def clear_form(self) -> None:
         self._apply_settings(AppSettings())
