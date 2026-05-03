@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import threading
 import traceback
@@ -42,7 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "aspectfix_dragdrop_config.json"
 LOG_FOLDER_NAME = "logs"
 REPORT_FILE_PREFIX = "aspectfix_report_"
-DEFAULT_WINDOW_GEOMETRY = "1560x980"
+DEFAULT_WINDOW_GEOMETRY = "1280x1024"
 DEFAULT_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
 INVALID_FILE_NAME_CHARS = set('<>:"/\\|?*')
 DROP_MESSAGE = "ここに画像ファイルをドラッグ＆ドロップ"
@@ -302,7 +303,7 @@ class AspectFixApp(AppBase):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.minsize(1320, 860)
+        self.minsize(1280, 900)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.config_data = load_config()
@@ -369,15 +370,45 @@ class AspectFixApp(AppBase):
             self._append_log_line(f"Pillow の読み込みに失敗しています: {PIL_IMPORT_ERROR}")
 
     def _build_ui(self) -> None:
+        self._build_menu()
         root = ttk.Frame(self, padding=12)
         root.grid(row=0, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=3)
-        root.rowconfigure(3, weight=1)
+        root.rowconfigure(1, weight=1)
 
-        drop_frame = ttk.LabelFrame(root, text="画像追加", padding=12)
+        action_bar = ttk.Frame(root)
+        action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(action_bar, text="基本操作").pack(side="left")
+        ttk.Button(action_bar, text="設定保存", command=self.save_current_config).pack(side="left", padx=(12, 0))
+        ttk.Button(action_bar, text="設定読込", command=self.reload_config_from_file).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="ファイル追加", command=self.add_files_from_dialog).pack(side="left", padx=(16, 0))
+        ttk.Button(action_bar, text="フォルダ追加", command=self.add_folder_from_dialog).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="処理開始", command=self.start_processing).pack(side="left", padx=(16, 0))
+        ttk.Button(action_bar, text="停止要求", command=self.request_stop).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="出力先を開く", command=self.open_output_folder).pack(side="left", padx=(8, 0))
+
+        notebook = ttk.Notebook(root)
+        notebook.grid(row=1, column=0, sticky="nsew")
+        settings_tab = ttk.Frame(notebook, padding=10)
+        list_tab = ttk.Frame(notebook, padding=10)
+        preview_tab = ttk.Frame(notebook, padding=10)
+        log_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(settings_tab, text="設定")
+        notebook.add(list_tab, text="対象リスト")
+        notebook.add(preview_tab, text="実行 / プレビュー")
+        notebook.add(log_tab, text="ログ")
+
+        settings_tab.columnconfigure(0, weight=1)
+        list_tab.columnconfigure(0, weight=1)
+        list_tab.rowconfigure(0, weight=1)
+        preview_tab.columnconfigure(0, weight=1)
+        preview_tab.rowconfigure(2, weight=1)
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
+
+        drop_frame = ttk.LabelFrame(settings_tab, text="画像追加", padding=12)
         drop_frame.grid(row=0, column=0, sticky="ew")
         drop_frame.columnconfigure(0, weight=1)
         self.drop_label = tk.Label(
@@ -397,7 +428,7 @@ class AspectFixApp(AppBase):
         self.drop_note_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self._update_drop_note()
 
-        settings_frame = ttk.LabelFrame(root, text="設定", padding=12)
+        settings_frame = ttk.LabelFrame(settings_tab, text="設定", padding=12)
         settings_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         settings_frame.columnconfigure(0, weight=1)
 
@@ -518,14 +549,8 @@ class AspectFixApp(AppBase):
         self.save_config_button = ttk.Button(option_row, text="設定保存", command=self.save_current_config)
         self.save_config_button.grid(row=1, column=2, sticky="e", pady=(6, 0))
 
-        content = ttk.Frame(root)
-        content.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
-        content.rowconfigure(0, weight=1)
-
-        list_frame = ttk.LabelFrame(content, text="処理対象リスト", padding=12)
-        list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        list_frame = ttk.LabelFrame(list_tab, text="処理対象リスト", padding=12)
+        list_frame.grid(row=0, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(1, weight=1)
 
@@ -564,12 +589,7 @@ class AspectFixApp(AppBase):
         tree_scroll_x.grid(row=2, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_selection_changed)
 
-        right_panel = ttk.Frame(content)
-        right_panel.grid(row=0, column=1, sticky="nsew")
-        right_panel.columnconfigure(0, weight=1)
-        right_panel.rowconfigure(2, weight=1)
-
-        action_frame = ttk.LabelFrame(right_panel, text="操作", padding=12)
+        action_frame = ttk.LabelFrame(preview_tab, text="操作", padding=12)
         action_frame.grid(row=0, column=0, sticky="ew")
         for column in range(5):
             action_frame.columnconfigure(column, weight=1)
@@ -593,7 +613,7 @@ class AspectFixApp(AppBase):
         self.progress_bar = ttk.Progressbar(progress_frame, maximum=1.0, value=0.0)
         self.progress_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
-        info_frame = ttk.LabelFrame(right_panel, text="現在選択中画像の情報", padding=12)
+        info_frame = ttk.LabelFrame(preview_tab, text="現在選択中画像の情報", padding=12)
         info_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         for column in range(4):
             info_frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
@@ -612,7 +632,7 @@ class AspectFixApp(AppBase):
         ttk.Label(info_frame, text="保存アスペクト比").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Label(info_frame, textvariable=self.saved_aspect_var).grid(row=3, column=1, sticky="w", padx=(8, 12), pady=(8, 0))
 
-        preview_frame = ttk.LabelFrame(right_panel, text="プレビュー", padding=12)
+        preview_frame = ttk.LabelFrame(preview_tab, text="プレビュー", padding=12)
         preview_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
@@ -622,12 +642,83 @@ class AspectFixApp(AppBase):
             justify="left",
         ).grid(row=0, column=0, sticky="nw")
 
-        log_frame = ttk.LabelFrame(root, text="ログ", padding=12)
-        log_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        log_frame = ttk.LabelFrame(log_tab, text="ログ", padding=12)
+        log_frame.grid(row=0, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state="disabled", wrap="word", font=("Consolas", 10))
         self.log_text.grid(row=0, column=0, sticky="nsew")
+
+        status_frame = ttk.LabelFrame(root, text="状態", padding=10)
+        status_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        status_frame.columnconfigure(1, weight=1)
+        ttk.Label(status_frame, text="状態").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(status_frame, textvariable=self.progress_text_var).grid(row=0, column=2, sticky="e")
+        self.status_progress_bar = ttk.Progressbar(status_frame, maximum=1.0, value=0.0)
+        self.status_progress_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+
+    def _build_menu(self) -> None:
+        menu_bar = tk.Menu(self)
+
+        file_menu = tk.Menu(menu_bar, tearoff=False)
+        file_menu.add_command(label="設定保存", command=self.save_current_config)
+        file_menu.add_command(label="設定読込", command=self.reload_config_from_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="終了", command=self.on_close)
+        menu_bar.add_cascade(label="ファイル", menu=file_menu)
+
+        list_menu = tk.Menu(menu_bar, tearoff=False)
+        list_menu.add_command(label="ファイル追加", command=self.add_files_from_dialog)
+        list_menu.add_command(label="フォルダ追加", command=self.add_folder_from_dialog)
+        list_menu.add_separator()
+        list_menu.add_command(label="選択行を削除", command=self.remove_selected_items)
+        list_menu.add_command(label="リストをクリア", command=self.clear_items)
+        list_menu.add_command(label="存在しないファイルを除外", command=self.remove_missing_items)
+        menu_bar.add_cascade(label="対象", menu=list_menu)
+
+        run_menu = tk.Menu(menu_bar, tearoff=False)
+        run_menu.add_command(label="処理開始", command=self.start_processing)
+        run_menu.add_command(label="停止要求", command=self.request_stop)
+        run_menu.add_separator()
+        run_menu.add_command(label="出力先を開く", command=self.open_output_folder)
+        menu_bar.add_cascade(label="実行", menu=run_menu)
+
+        view_menu = tk.Menu(menu_bar, tearoff=False)
+        view_menu.add_command(label="README を開く", command=self.open_readme)
+        menu_bar.add_cascade(label="表示", menu=view_menu)
+
+        self.configure(menu=menu_bar)
+
+    def reload_config_from_file(self) -> None:
+        self._load_config_into_vars(load_config())
+        self._update_canvas_control_states()
+        self.status_var.set("設定を読み込みました")
+        self._append_log_line(f"設定を読み込みました: {CONFIG_PATH}")
+
+    def _set_progress_state(self, maximum: float, value: float) -> None:
+        normalized_max = max(1.0, float(maximum))
+        normalized_value = min(max(0.0, float(value)), normalized_max)
+        self.progress_bar.configure(maximum=normalized_max, value=normalized_value)
+        self.status_progress_bar.configure(maximum=normalized_max, value=normalized_value)
+
+    def open_output_folder(self) -> None:
+        output_folder = self.output_folder_var.get().strip()
+        if not output_folder:
+            messagebox.showwarning(APP_TITLE, "出力フォルダを指定してください。")
+            return
+        path = Path(output_folder)
+        if not path.exists():
+            messagebox.showwarning(APP_TITLE, "出力フォルダがまだ存在しません。")
+            return
+        os.startfile(path)
+
+    def open_readme(self) -> None:
+        for candidate in (BASE_DIR / "README_aspectfix_dragdrop.md", BASE_DIR / "README_aspectfix_dragdrop.txt"):
+            if candidate.exists():
+                os.startfile(candidate)
+                return
+        os.startfile(BASE_DIR)
 
     def _load_config_into_vars(self, config: AppConfig) -> None:
         self.output_folder_var.set(config.output_folder)
@@ -1145,7 +1236,7 @@ class AspectFixApp(AppBase):
 
         self.status_var.set("処理を開始します")
         self.progress_text_var.set(f"0 / {len(self.items)} 件")
-        self.progress_bar.configure(maximum=max(1, len(self.items)), value=0)
+        self._set_progress_state(max(1, len(self.items)), 0)
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.save_config_button.configure(state="disabled")
@@ -1327,7 +1418,7 @@ class AspectFixApp(AppBase):
         if kind == "progress":
             current = int(message.get("current", 0))
             total = max(1, int(message.get("total", 1)))
-            self.progress_bar.configure(maximum=total, value=min(current, total))
+            self._set_progress_state(total, min(current, total))
             self.progress_text_var.set(f"{min(current, total)} / {total} 件")
             self.status_var.set(f"処理中 {min(current, total)} / {total} 件")
             return
@@ -1341,7 +1432,7 @@ class AspectFixApp(AppBase):
             if isinstance(summary, BatchSummary):
                 total = max(1, summary.total_count)
                 processed = summary.success_count + summary.failure_count + summary.skip_count
-                self.progress_bar.configure(maximum=total, value=min(processed, total))
+                self._set_progress_state(total, min(processed, total))
                 self.progress_text_var.set(f"{min(processed, total)} / {summary.total_count} 件")
                 if fatal_error:
                     self.status_var.set("致命的エラー")

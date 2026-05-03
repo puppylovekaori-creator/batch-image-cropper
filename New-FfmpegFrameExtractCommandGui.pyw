@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import json
 import math
@@ -143,8 +144,9 @@ class AppSettings:
     prevent_sleep: bool = True
     after_complete_action: str = "none"
     input_video_history: list[str] = field(default_factory=list)
-    window_width: int = 1440
-    window_height: int = 1080
+    last_queue: list[dict[str, object]] = field(default_factory=list)
+    window_width: int = 1280
+    window_height: int = 1024
     column_widths: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_COLUMN_WIDTHS))
 
     @classmethod
@@ -160,6 +162,8 @@ class AppSettings:
 
         history = data.get("InputVideoHistory", [])
         history_list = [str(item).strip() for item in history if str(item).strip()] if isinstance(history, list) else []
+        last_queue_raw = data.get("LastQueue", [])
+        last_queue = last_queue_raw if isinstance(last_queue_raw, list) else []
 
         return cls(
             input_path=_safe_string(data.get("InputPath", "")),
@@ -205,8 +209,9 @@ class AppSettings:
                 "none",
             ),
             input_video_history=_unique_strings(history_list),
-            window_width=_clamp(_safe_int(window_size.get("Width", 1440), 1440), 1000, 2800),
-            window_height=_clamp(_safe_int(window_size.get("Height", 1080), 1080), 760, 2000),
+            last_queue=last_queue,
+            window_width=_clamp(_safe_int(window_size.get("Width", 1280), 1280), 1280, 2800),
+            window_height=_clamp(_safe_int(window_size.get("Height", 1024), 1024), 900, 2000),
             column_widths=column_widths,
         )
 
@@ -240,6 +245,7 @@ class AppSettings:
             "PreventSleep": raw["prevent_sleep"],
             "AfterCompleteAction": raw["after_complete_action"],
             "InputVideoHistory": raw["input_video_history"],
+            "LastQueue": raw["last_queue"],
             "WindowSize": {
                 "Width": raw["window_width"],
                 "Height": raw["window_height"],
@@ -1111,7 +1117,7 @@ class FfmpegFrameExtractCommandGui:
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
         self.root.geometry(f"{self.loaded_settings.window_width}x{self.loaded_settings.window_height}")
-        self.root.minsize(1200, 860)
+        self.root.minsize(1280, 900)
 
         self.style = ttk.Style(self.root)
         try:
@@ -1191,10 +1197,12 @@ class FfmpegFrameExtractCommandGui:
         self.last_log_path: Path | None = None
         self.last_summary_paths: tuple[Path, Path] | None = None
         self.current_run_output_root: Path | None = None
+        self._pending_autosave_id: str | None = None
 
         self._build_layout()
         self._bind_events()
         self._apply_settings(self.loaded_settings)
+        self._restore_queue_from_settings(self.loaded_settings.last_queue)
         self._restore_column_widths()
         self._install_context_menus()
         self._install_drag_and_drop()
@@ -1207,13 +1215,50 @@ class FfmpegFrameExtractCommandGui:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_layout(self) -> None:
+        self._build_menu()
         self.root.columnconfigure(0, weight=1)
-        for row in (0, 1, 2, 3, 4):
-            self.root.rowconfigure(row, weight=0)
-        self.root.rowconfigure(5, weight=1)
+        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=0)
 
-        queue_group = ttk.LabelFrame(self.root, text="入力動画キュー", padding=10)
-        queue_group.grid(row=0, column=0, padx=10, pady=(10, 6), sticky="nsew")
+        action_bar = ttk.Frame(self.root, padding=(10, 10, 10, 6))
+        action_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(action_bar, text="基本操作").pack(side="left")
+        ttk.Button(action_bar, text="設定保存", command=self._save_current_settings).pack(side="left", padx=(12, 0))
+        ttk.Button(action_bar, text="設定読込", command=self.load_saved_settings).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="ジョブ保存", command=self.save_job_file).pack(side="left", padx=(16, 0))
+        ttk.Button(action_bar, text="ジョブ読込", command=self.load_job_file).pack(side="left", padx=(8, 0))
+        ttk.Separator(action_bar, orient="vertical").pack(side="left", fill="y", padx=12)
+        self.dry_run_button = ttk.Button(action_bar, text="ドライラン", command=self.run_dry_run)
+        self.dry_run_button.pack(side="left")
+        self.run_button = ttk.Button(action_bar, text="一括実行", command=self.start_batch_run)
+        self.run_button.pack(side="left", padx=(8, 0))
+        self.pause_button = ttk.Button(action_bar, text="一時停止", command=self.request_pause)
+        self.pause_button.pack(side="left", padx=(8, 0))
+        self.resume_button = ttk.Button(action_bar, text="再開", command=self.resume_batch_run)
+        self.resume_button.pack(side="left", padx=(8, 0))
+        self.cancel_button = ttk.Button(action_bar, text="キャンセル", command=self.cancel_batch_run)
+        self.cancel_button.pack(side="left", padx=(8, 0))
+        ttk.Separator(action_bar, orient="vertical").pack(side="left", fill="y", padx=12)
+        ttk.Button(action_bar, text="単体コマンド生成", command=self.generate_command).pack(side="left")
+        ttk.Button(action_bar, text="単体実行", command=self.execute_command).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="出力先を開く", command=self.open_output_folder).pack(side="left", padx=(16, 0))
+        ttk.Button(action_bar, text="ログ保存", command=self.save_log_to_file).pack(side="left", padx=(8, 0))
+
+        notebook = ttk.Notebook(self.root)
+        notebook.grid(row=1, column=0, padx=10, pady=(0, 6), sticky="nsew")
+        queue_tab = ttk.Frame(notebook, padding=10)
+        settings_tab = ttk.Frame(notebook, padding=10)
+        single_tab = ttk.Frame(notebook, padding=10)
+        log_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(queue_tab, text="キュー")
+        notebook.add(settings_tab, text="設定")
+        notebook.add(single_tab, text="単体モード")
+        notebook.add(log_tab, text="ログ")
+
+        queue_tab.columnconfigure(0, weight=1)
+        queue_tab.rowconfigure(0, weight=1)
+        queue_group = ttk.LabelFrame(queue_tab, text="入力動画キュー", padding=10)
+        queue_group.grid(row=0, column=0, sticky="nsew")
         queue_group.columnconfigure(0, weight=1)
         queue_group.rowconfigure(0, weight=1)
 
@@ -1246,22 +1291,25 @@ class FfmpegFrameExtractCommandGui:
 
         queue_buttons = ttk.Frame(queue_group)
         queue_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(queue_buttons, text="動画ファイル追加", command=self.add_video_files).pack(side="left")
-        ttk.Button(queue_buttons, text="フォルダから一括追加", command=self.add_video_folder).pack(side="left", padx=(8, 0))
-        ttk.Button(queue_buttons, text="選択行を削除", command=self.remove_selected_rows).pack(side="left", padx=(16, 0))
-        ttk.Button(queue_buttons, text="一覧をクリア", command=self.clear_queue).pack(side="left", padx=(8, 0))
-        ttk.Button(queue_buttons, text="上へ", command=lambda: self.move_selected_rows(-1)).pack(side="left", padx=(16, 0))
-        ttk.Button(queue_buttons, text="下へ", command=lambda: self.move_selected_rows(1)).pack(side="left", padx=(8, 0))
-        ttk.Button(queue_buttons, text="重複削除", command=self.remove_duplicate_rows).pack(side="left", padx=(16, 0))
-        ttk.Button(queue_buttons, text="存在しないファイルを除外", command=self.remove_missing_rows).pack(side="left", padx=(8, 0))
-        ttk.Button(queue_buttons, text="選択反転", command=self.toggle_selected_flags).pack(side="left", padx=(16, 0))
+        for column in range(5):
+            queue_buttons.columnconfigure(column, weight=1)
+        ttk.Button(queue_buttons, text="動画ファイル追加", command=self.add_video_files).grid(row=0, column=0, sticky="ew")
+        ttk.Button(queue_buttons, text="フォルダから一括追加", command=self.add_video_folder).grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(queue_buttons, text="選択行を削除", command=self.remove_selected_rows).grid(row=0, column=2, sticky="ew")
+        ttk.Button(queue_buttons, text="一覧をクリア", command=self.clear_queue).grid(row=0, column=3, sticky="ew", padx=(8, 8))
+        ttk.Button(queue_buttons, text="選択反転", command=self.toggle_selected_flags).grid(row=0, column=4, sticky="ew")
+        ttk.Button(queue_buttons, text="上へ", command=lambda: self.move_selected_rows(-1)).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(queue_buttons, text="下へ", command=lambda: self.move_selected_rows(1)).grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(8, 0))
+        ttk.Button(queue_buttons, text="重複削除", command=self.remove_duplicate_rows).grid(row=1, column=2, sticky="ew", pady=(8, 0))
+        ttk.Button(queue_buttons, text="存在しないファイルを除外", command=self.remove_missing_rows).grid(row=1, column=3, sticky="ew", padx=(8, 8), pady=(8, 0))
         ttk.Label(
             queue_buttons,
             text="動画ファイルやフォルダをこの画面へドラッグ＆ドロップして追加できます。",
-        ).pack(side="right")
+        ).grid(row=1, column=4, sticky="e", pady=(8, 0))
 
-        settings_group = ttk.LabelFrame(self.root, text="出力ルートと抽出設定", padding=10)
-        settings_group.grid(row=1, column=0, padx=10, pady=6, sticky="nsew")
+        settings_tab.columnconfigure(0, weight=1)
+        settings_group = ttk.LabelFrame(settings_tab, text="出力ルートと抽出設定", padding=10)
+        settings_group.grid(row=0, column=0, sticky="nsew")
         settings_group.columnconfigure(1, weight=1)
         settings_group.columnconfigure(3, weight=1)
 
@@ -1409,8 +1457,18 @@ class FfmpegFrameExtractCommandGui:
         ).pack(side="left")
         ttk.Label(after_action_row, text="シャットダウン / スリープは実行前に確認が出ます。").pack(side="left", padx=(8, 0))
 
-        preview_group = ttk.LabelFrame(self.root, text="単体モードのファイル名プレビュー", padding=10)
-        preview_group.grid(row=2, column=0, padx=10, pady=6, sticky="nsew")
+        single_tab.columnconfigure(0, weight=1)
+        single_tab.rowconfigure(1, weight=1)
+        single_tab.rowconfigure(2, weight=1)
+        single_info = ttk.LabelFrame(single_tab, text="単体モードの使い方", padding=10)
+        single_info.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(
+            single_info,
+            text="入力動画、単体出力フォルダ、単体連番ベース名は設定タブで指定します。ここではプレビュー、コマンド生成、単体実行を行います。",
+        ).grid(row=0, column=0, sticky="w")
+
+        preview_group = ttk.LabelFrame(single_tab, text="単体モードのファイル名プレビュー", padding=10)
+        preview_group.grid(row=1, column=0, pady=(0, 8), sticky="nsew")
         preview_group.columnconfigure(0, weight=1)
         preview_group.rowconfigure(0, weight=1)
         self.preview_text = tk.Text(preview_group, height=4, wrap="none", font=("Consolas", 10))
@@ -1419,8 +1477,8 @@ class FfmpegFrameExtractCommandGui:
         preview_scroll.grid(row=0, column=1, sticky="ns")
         self.preview_text.configure(yscrollcommand=preview_scroll.set)
 
-        command_group = ttk.LabelFrame(self.root, text="単体モードの生成コマンド", padding=10)
-        command_group.grid(row=3, column=0, padx=10, pady=6, sticky="nsew")
+        command_group = ttk.LabelFrame(single_tab, text="単体モードの生成コマンド", padding=10)
+        command_group.grid(row=2, column=0, sticky="nsew")
         command_group.columnconfigure(0, weight=1)
         command_group.rowconfigure(1, weight=1)
         ttk.Label(command_group, text="PowerShell にそのまま貼り付けて実行できる形式で出力します。").grid(
@@ -1437,47 +1495,31 @@ class FfmpegFrameExtractCommandGui:
         command_x_scroll.grid(row=2, column=0, sticky="ew")
         self.command_text.configure(yscrollcommand=command_y_scroll.set, xscrollcommand=command_x_scroll.set)
 
-        control_group = ttk.LabelFrame(self.root, text="操作と進捗", padding=10)
-        control_group.grid(row=4, column=0, padx=10, pady=6, sticky="nsew")
-        control_group.columnconfigure(0, weight=1)
-        control_group.columnconfigure(1, weight=1)
-
-        single_button_row = ttk.Frame(control_group)
-        single_button_row.grid(row=0, column=0, sticky="w", pady=(0, 8))
-        ttk.Label(single_button_row, text="単体モード").pack(side="left")
+        single_button_row = ttk.Frame(single_tab)
+        single_button_row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(single_button_row, text="単体操作").pack(side="left")
         ttk.Button(single_button_row, text="コマンド生成", command=self.generate_command).pack(side="left", padx=(12, 0))
         ttk.Button(single_button_row, text="コピー", command=self.copy_command).pack(side="left", padx=(8, 0))
         ttk.Button(single_button_row, text="生成してコピー", command=self.generate_and_copy).pack(side="left", padx=(8, 0))
         ttk.Button(single_button_row, text="実行", command=self.execute_command).pack(side="left", padx=(8, 0))
         ttk.Button(single_button_row, text="クリア", command=self.clear_form).pack(side="left", padx=(8, 0))
 
-        batch_button_row = ttk.Frame(control_group)
-        batch_button_row.grid(row=0, column=1, sticky="e", pady=(0, 8))
-        ttk.Label(batch_button_row, text="バッチモード").pack(side="left")
-        self.dry_run_button = ttk.Button(batch_button_row, text="ドライラン", command=self.run_dry_run)
-        self.dry_run_button.pack(side="left", padx=(12, 0))
-        self.run_button = ttk.Button(batch_button_row, text="一括実行", command=self.start_batch_run)
-        self.run_button.pack(side="left", padx=(8, 0))
-        self.pause_button = ttk.Button(batch_button_row, text="一時停止", command=self.request_pause)
-        self.pause_button.pack(side="left", padx=(8, 0))
-        self.resume_button = ttk.Button(batch_button_row, text="再開", command=self.resume_batch_run)
-        self.resume_button.pack(side="left", padx=(8, 0))
-        self.cancel_button = ttk.Button(batch_button_row, text="キャンセル", command=self.cancel_batch_run)
-        self.cancel_button.pack(side="left", padx=(8, 0))
-        ttk.Button(batch_button_row, text="出力フォルダを開く", command=self.open_output_folder).pack(side="left", padx=(8, 0))
-        ttk.Button(batch_button_row, text="ログ保存", command=self.save_log_to_file).pack(side="left", padx=(8, 0))
-        ttk.Button(batch_button_row, text="ジョブ保存", command=self.save_job_file).pack(side="left", padx=(8, 0))
-        ttk.Button(batch_button_row, text="ジョブ読込", command=self.load_job_file).pack(side="left", padx=(8, 0))
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(1, weight=1)
+        runtime_group = ttk.LabelFrame(log_tab, text="実行状態", padding=10)
+        runtime_group.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        runtime_group.columnconfigure(1, weight=1)
+        ttk.Label(runtime_group, text="現在処理中").grid(row=0, column=0, sticky="w")
+        ttk.Label(runtime_group, textvariable=self.current_video_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(runtime_group, text="処理済み本数").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(runtime_group, textvariable=self.overall_count_var).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Label(runtime_group, text="出力枚数").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(runtime_group, textvariable=self.output_count_var).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Label(runtime_group, text="状態").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(runtime_group, textvariable=self.status_var).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
-        ttk.Label(control_group, textvariable=self.current_video_var).grid(row=1, column=0, sticky="w")
-        ttk.Label(control_group, textvariable=self.overall_count_var).grid(row=1, column=1, sticky="e")
-        self.overall_progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 8))
-        ttk.Label(control_group, textvariable=self.output_count_var).grid(row=3, column=0, sticky="w")
-        ttk.Label(control_group, textvariable=self.status_var).grid(row=3, column=1, sticky="e")
-        self.current_progress.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-
-        log_group = ttk.LabelFrame(self.root, text="進捗とログ", padding=10)
-        log_group.grid(row=5, column=0, padx=10, pady=(6, 10), sticky="nsew")
+        log_group = ttk.LabelFrame(log_tab, text="進捗とログ", padding=10)
+        log_group.grid(row=1, column=0, sticky="nsew")
         log_group.columnconfigure(0, weight=1)
         log_group.rowconfigure(0, weight=1)
         self.log_text = tk.Text(log_group, wrap="none", font=("Consolas", 10))
@@ -1490,6 +1532,69 @@ class FfmpegFrameExtractCommandGui:
         log_x_scroll = ttk.Scrollbar(log_group, orient="horizontal", command=self.log_text.xview)
         log_x_scroll.grid(row=1, column=0, sticky="ew")
         self.log_text.configure(yscrollcommand=log_y_scroll.set, xscrollcommand=log_x_scroll.set)
+
+        status_group = ttk.LabelFrame(self.root, text="状態と進捗", padding=10)
+        status_group.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
+        status_group.columnconfigure(0, weight=1)
+        status_group.columnconfigure(1, weight=1)
+        ttk.Label(status_group, textvariable=self.current_video_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(status_group, textvariable=self.overall_count_var).grid(row=0, column=1, sticky="e")
+        self.overall_progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+        ttk.Label(status_group, textvariable=self.output_count_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(status_group, textvariable=self.status_var).grid(row=2, column=1, sticky="e")
+        self.current_progress.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+    def _build_menu(self) -> None:
+        menu_bar = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menu_bar, tearoff=False)
+        file_menu.add_command(label="設定保存", command=self._save_current_settings)
+        file_menu.add_command(label="設定読込", command=self.load_saved_settings)
+        file_menu.add_separator()
+        file_menu.add_command(label="ジョブ保存", command=self.save_job_file)
+        file_menu.add_command(label="ジョブ読込", command=self.load_job_file)
+        file_menu.add_separator()
+        file_menu.add_command(label="終了", command=self.on_close)
+        menu_bar.add_cascade(label="ファイル", menu=file_menu)
+
+        queue_menu = tk.Menu(menu_bar, tearoff=False)
+        queue_menu.add_command(label="動画ファイル追加", command=self.add_video_files)
+        queue_menu.add_command(label="フォルダから一括追加", command=self.add_video_folder)
+        queue_menu.add_separator()
+        queue_menu.add_command(label="選択行を削除", command=self.remove_selected_rows)
+        queue_menu.add_command(label="一覧をクリア", command=self.clear_queue)
+        queue_menu.add_command(label="上へ", command=lambda: self.move_selected_rows(-1))
+        queue_menu.add_command(label="下へ", command=lambda: self.move_selected_rows(1))
+        queue_menu.add_command(label="重複削除", command=self.remove_duplicate_rows)
+        queue_menu.add_command(label="存在しないファイルを除外", command=self.remove_missing_rows)
+        queue_menu.add_command(label="選択反転", command=self.toggle_selected_flags)
+        menu_bar.add_cascade(label="キュー", menu=queue_menu)
+
+        run_menu = tk.Menu(menu_bar, tearoff=False)
+        run_menu.add_command(label="ドライラン", command=self.run_dry_run)
+        run_menu.add_command(label="一括実行", command=self.start_batch_run)
+        run_menu.add_command(label="一時停止", command=self.request_pause)
+        run_menu.add_command(label="再開", command=self.resume_batch_run)
+        run_menu.add_command(label="キャンセル", command=self.cancel_batch_run)
+        run_menu.add_separator()
+        run_menu.add_command(label="出力フォルダを開く", command=self.open_output_folder)
+        run_menu.add_command(label="ログ保存", command=self.save_log_to_file)
+        menu_bar.add_cascade(label="実行", menu=run_menu)
+
+        single_menu = tk.Menu(menu_bar, tearoff=False)
+        single_menu.add_command(label="コマンド生成", command=self.generate_command)
+        single_menu.add_command(label="コピー", command=self.copy_command)
+        single_menu.add_command(label="生成してコピー", command=self.generate_and_copy)
+        single_menu.add_command(label="実行", command=self.execute_command)
+        single_menu.add_command(label="クリア", command=self.clear_form)
+        menu_bar.add_cascade(label="単体モード", menu=single_menu)
+
+        view_menu = tk.Menu(menu_bar, tearoff=False)
+        view_menu.add_command(label="ログフォルダを開く", command=self.open_logs_folder)
+        view_menu.add_command(label="README を開く", command=self.open_readme)
+        menu_bar.add_cascade(label="表示", menu=view_menu)
+
+        self.root.configure(menu=menu_bar)
 
     def _bind_events(self) -> None:
         tracked_vars = [
@@ -1551,8 +1656,8 @@ class FfmpegFrameExtractCommandGui:
         self.after_complete_action_var.set(self._mode_label(settings.after_complete_action, AFTER_COMPLETE_ACTION_LABELS))
 
     def collect_settings(self) -> AppSettings:
-        width = max(self.root.winfo_width(), 1200)
-        height = max(self.root.winfo_height(), 860)
+        width = max(self.root.winfo_width(), 1280)
+        height = max(self.root.winfo_height(), 1024)
         history = self._build_input_video_history()
         return AppSettings(
             input_path=self.input_path_var.get().strip(),
@@ -1582,6 +1687,7 @@ class FfmpegFrameExtractCommandGui:
             prevent_sleep=self.prevent_sleep_var.get(),
             after_complete_action=self._mode_key(self.after_complete_action_var.get(), AFTER_COMPLETE_ACTION_LABELS),
             input_video_history=history,
+            last_queue=[item.to_job_dict() for item in self.queue_items],
             window_width=width,
             window_height=height,
             column_widths=self._capture_column_widths(),
@@ -1596,6 +1702,44 @@ class FfmpegFrameExtractCommandGui:
         existing = self.loaded_settings.input_video_history if self.loaded_settings else []
         history.extend(existing)
         return _unique_strings(history)[:100]
+
+    def _restore_queue_from_settings(self, raw_items: list[dict[str, object]]) -> None:
+        self.queue_items.clear()
+        self.next_queue_id = 1
+        if not raw_items:
+            return
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            input_path = _safe_string(raw.get("input_path", ""))
+            if not input_path:
+                continue
+            item = VideoQueueItem(
+                queue_id=f"q{self.next_queue_id:05d}",
+                input_path=input_path,
+                enabled=_safe_bool(raw.get("enabled", True)),
+                output_dir=_safe_string(raw.get("output_dir", "")),
+                status=_safe_choice(raw.get("status", "未処理"), QUEUE_STATUSES, "未処理"),
+            )
+            self.next_queue_id += 1
+            self.queue_items.append(item)
+        if self.queue_items:
+            self._hydrate_queue_metadata()
+
+    def _schedule_autosave(self) -> None:
+        if self._pending_autosave_id is not None:
+            try:
+                self.root.after_cancel(self._pending_autosave_id)
+            except tk.TclError:
+                pass
+        self._pending_autosave_id = self.root.after(700, self._perform_autosave)
+
+    def _perform_autosave(self) -> None:
+        self._pending_autosave_id = None
+        try:
+            self._save_current_settings()
+        except Exception:
+            pass
 
     def _restore_column_widths(self) -> None:
         for key, width in self.loaded_settings.column_widths.items():
@@ -1613,6 +1757,7 @@ class FfmpegFrameExtractCommandGui:
         self.update_preview()
         self._refresh_queue_plans()
         self._refresh_queue_tree()
+        self._schedule_autosave()
 
     def update_option_states(self) -> None:
         settings = self.collect_settings()
@@ -1793,6 +1938,7 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_tree()
         self.status_var.set(f"{len(expanded_paths)} 本の動画をキューへ追加しました。")
         self._append_log(f"キュー追加: {len(expanded_paths)} 本", tag="info")
+        self._schedule_autosave()
 
     def _refresh_queue_plans(self) -> None:
         settings = self.collect_settings()
@@ -1851,6 +1997,7 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_plans()
         self._refresh_queue_tree()
         self.status_var.set(f"{len(selected_ids)} 行を削除しました。")
+        self._schedule_autosave()
 
     def clear_queue(self) -> None:
         if not self.queue_items:
@@ -1861,6 +2008,7 @@ class FfmpegFrameExtractCommandGui:
         self.queue_items.clear()
         self._refresh_queue_tree()
         self.status_var.set("動画キューをクリアしました。")
+        self._schedule_autosave()
 
     def move_selected_rows(self, direction: int) -> None:
         selected_ids = self.queue_tree.selection()
@@ -1881,6 +2029,7 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_plans()
         self._refresh_queue_tree()
         self.queue_tree.selection_set(selected_ids)
+        self._schedule_autosave()
 
     def remove_duplicate_rows(self) -> None:
         seen: set[str] = set()
@@ -1897,6 +2046,7 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_plans()
         self._refresh_queue_tree()
         self.status_var.set(f"重複行を {removed} 件削除しました。")
+        self._schedule_autosave()
 
     def remove_missing_rows(self) -> None:
         before = len(self.queue_items)
@@ -1905,6 +2055,7 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_plans()
         self._refresh_queue_tree()
         self.status_var.set(f"存在しないファイルを {removed} 件除外しました。")
+        self._schedule_autosave()
 
     def toggle_selected_flags(self) -> None:
         selected_ids = set(self.queue_tree.selection())
@@ -1914,6 +2065,7 @@ class FfmpegFrameExtractCommandGui:
             if item.queue_id in selected_ids:
                 item.enabled = not item.enabled
         self._refresh_queue_tree()
+        self._schedule_autosave()
 
     def _on_tree_left_click(self, event: tk.Event) -> str | None:
         region = self.queue_tree.identify("region", event.x, event.y)
@@ -1924,6 +2076,7 @@ class FfmpegFrameExtractCommandGui:
             if item:
                 item.enabled = not item.enabled
                 self._refresh_queue_tree()
+                self._schedule_autosave()
             return "break"
         return None
 
@@ -3153,6 +3306,7 @@ class FfmpegFrameExtractCommandGui:
         self._refresh_queue_plans()
         self._refresh_queue_tree()
         self.status_var.set("ジョブを読み込みました。")
+        self._schedule_autosave()
 
     def _hydrate_queue_metadata(self) -> None:
         settings = self.collect_settings()
@@ -3292,8 +3446,30 @@ class FfmpegFrameExtractCommandGui:
             settings = self.collect_settings()
             save_settings(settings)
             self.loaded_settings = settings
+            self.status_var.set("設定を保存しました。")
         except Exception as exc:
             messagebox.showerror("設定保存", f"設定ファイルの保存に失敗しました。\n\n{exc}", parent=self.root)
+
+    def load_saved_settings(self) -> None:
+        settings = load_settings()
+        self.loaded_settings = settings
+        self._apply_settings(settings)
+        self._restore_column_widths()
+        self._restore_queue_from_settings(settings.last_queue)
+        self._refresh_queue_plans()
+        self._refresh_queue_tree()
+        self.status_var.set("設定を読み込みました。")
+
+    def open_logs_folder(self) -> None:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        os.startfile(LOGS_DIR)
+
+    def open_readme(self) -> None:
+        for candidate in (Path(__file__).with_name("README.md"), Path(__file__).with_name("README.txt")):
+            if candidate.exists():
+                os.startfile(candidate)
+                return
+        os.startfile(Path(__file__).resolve().parent)
 
     @staticmethod
     def _existing_directory(raw_path: str) -> str | None:
@@ -3342,7 +3518,15 @@ class FfmpegFrameExtractCommandGui:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--headless-smoke-test", action="store_true")
+    args, _unknown = parser.parse_known_args()
     app = FfmpegFrameExtractCommandGui()
+    if args.headless_smoke_test:
+        app.root.update_idletasks()
+        app.root.destroy()
+        print("gui_ok")
+        return 0
     app.run()
     return 0
 

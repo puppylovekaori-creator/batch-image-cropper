@@ -52,7 +52,7 @@ APP_TITLE = "人物画像ZIP前処理 GUI"
 WINDOWS_NEWLINE = "\r\n"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
-DEFAULT_WINDOW_GEOMETRY = "1240x900"
+DEFAULT_WINDOW_GEOMETRY = "1280x1024"
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 LOG_FOLDER_NAME = "ログ"
 REPORT_FILE_NAME = "判定レポート.txt"
@@ -1009,7 +1009,7 @@ class ZipPreprocessorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.minsize(1040, 780)
+        self.minsize(1280, 900)
 
         self.ui_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -1043,12 +1043,39 @@ class ZipPreprocessorApp(tk.Tk):
         self.after(120, self._process_ui_queue)
 
     def _build_ui(self) -> None:
+        self._build_menu()
         root_frame = ttk.Frame(self, padding=12)
         root_frame.pack(fill="both", expand=True)
         root_frame.columnconfigure(0, weight=1)
-        root_frame.rowconfigure(2, weight=1)
+        root_frame.rowconfigure(1, weight=1)
 
-        path_group = ttk.LabelFrame(root_frame, text="フォルダ設定", padding=12)
+        action_bar = ttk.Frame(root_frame)
+        action_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(action_bar, text="基本操作").pack(side="left")
+        ttk.Button(action_bar, text="設定保存", command=self.save_config).pack(side="left", padx=(12, 0))
+        ttk.Button(action_bar, text="設定読込", command=self.load_config).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="処理開始", command=self.start_processing).pack(side="left", padx=(16, 0))
+        ttk.Button(action_bar, text="停止要求", command=self.request_stop).pack(side="left", padx=(8, 0))
+        ttk.Button(action_bar, text="出力先を開く", command=self.open_output_folder).pack(side="left", padx=(8, 0))
+
+        notebook = ttk.Notebook(root_frame)
+        notebook.grid(row=1, column=0, sticky="nsew")
+        input_tab = ttk.Frame(notebook, padding=10)
+        setting_tab = ttk.Frame(notebook, padding=10)
+        run_tab = ttk.Frame(notebook, padding=10)
+        log_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(input_tab, text="入出力")
+        notebook.add(setting_tab, text="判定設定")
+        notebook.add(run_tab, text="実行")
+        notebook.add(log_tab, text="ログ")
+
+        input_tab.columnconfigure(0, weight=1)
+        setting_tab.columnconfigure(0, weight=1)
+        run_tab.columnconfigure(0, weight=1)
+        log_tab.columnconfigure(0, weight=1)
+        log_tab.rowconfigure(0, weight=1)
+
+        path_group = ttk.LabelFrame(input_tab, text="フォルダ設定", padding=12)
         path_group.grid(row=0, column=0, sticky="ew")
         path_group.columnconfigure(1, weight=1)
 
@@ -1057,8 +1084,8 @@ class ZipPreprocessorApp(tk.Tk):
         self._add_path_row(path_group, 2, "一時フォルダ", self.temp_folder_var)
         self._add_path_row(path_group, 3, "処理済みZIP保存先", self.done_folder_var)
 
-        settings_group = ttk.LabelFrame(root_frame, text="判定設定", padding=12)
-        settings_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        settings_group = ttk.LabelFrame(setting_tab, text="判定設定", padding=12)
+        settings_group.grid(row=0, column=0, sticky="ew")
         for column in range(4):
             settings_group.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
 
@@ -1077,10 +1104,10 @@ class ZipPreprocessorApp(tk.Tk):
         ttk.Checkbutton(check_frame, text="既存出力を上書き", variable=self.overwrite_output_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Checkbutton(check_frame, text="除外画像もコピーする", variable=self.copy_exclude_images_var).grid(row=1, column=1, sticky="w", pady=(4, 0))
 
-        action_group = ttk.LabelFrame(root_frame, text="実行", padding=12)
-        action_group.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        action_group = ttk.LabelFrame(run_tab, text="実行", padding=12)
+        action_group.grid(row=0, column=0, sticky="nsew")
         action_group.columnconfigure(0, weight=1)
-        action_group.rowconfigure(4, weight=1)
+        action_group.rowconfigure(3, weight=1)
 
         button_frame = ttk.Frame(action_group)
         button_frame.grid(row=0, column=0, sticky="ew")
@@ -1088,8 +1115,8 @@ class ZipPreprocessorApp(tk.Tk):
             button_frame.columnconfigure(index, weight=1)
 
         self.start_button = ttk.Button(button_frame, text="処理開始", command=self.start_processing)
-        self.start_button.grid(row=0, column=0, sticky="ew")
         self.stop_button = ttk.Button(button_frame, text="停止要求", command=self.request_stop, state="disabled")
+        self.start_button.grid(row=0, column=0, sticky="ew")
         self.stop_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
         self.save_button = ttk.Button(button_frame, text="設定保存", command=self.save_config)
         self.save_button.grid(row=0, column=2, sticky="ew", padx=(8, 0))
@@ -1113,10 +1140,59 @@ class ZipPreprocessorApp(tk.Tk):
         self.progress_bar.grid(row=0, column=0, sticky="ew")
         ttk.Label(progress_frame, textvariable=self.progress_text_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        ttk.Label(action_group, text="ログ").grid(row=3, column=0, sticky="w", pady=(12, 4))
-        self.log_text = scrolledtext.ScrolledText(action_group, height=22, wrap="word")
-        self.log_text.grid(row=4, column=0, sticky="nsew")
+        status_bar = ttk.LabelFrame(root_frame, text="状態", padding=10)
+        status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        status_bar.columnconfigure(0, weight=1)
+        ttk.Label(status_bar, textvariable=self.current_zip_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(status_bar, textvariable=self.status_var).grid(row=0, column=1, sticky="e")
+        self.status_progress_bar = ttk.Progressbar(status_bar, variable=self.progress_var, maximum=1.0)
+        self.status_progress_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(status_bar, textvariable=self.progress_text_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.log_text = scrolledtext.ScrolledText(log_tab, height=22, wrap="word")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
         self.log_text.configure(state="disabled")
+
+    def _build_menu(self) -> None:
+        menu_bar = tk.Menu(self)
+
+        file_menu = tk.Menu(menu_bar, tearoff=False)
+        file_menu.add_command(label="設定保存", command=self.save_config)
+        file_menu.add_command(label="設定読込", command=self.load_config)
+        file_menu.add_separator()
+        file_menu.add_command(label="終了", command=self._on_close)
+        menu_bar.add_cascade(label="ファイル", menu=file_menu)
+
+        run_menu = tk.Menu(menu_bar, tearoff=False)
+        run_menu.add_command(label="処理開始", command=self.start_processing)
+        run_menu.add_command(label="停止要求", command=self.request_stop)
+        run_menu.add_separator()
+        run_menu.add_command(label="出力先を開く", command=self.open_output_folder)
+        menu_bar.add_cascade(label="実行", menu=run_menu)
+
+        view_menu = tk.Menu(menu_bar, tearoff=False)
+        view_menu.add_command(label="README を開く", command=self.open_readme)
+        menu_bar.add_cascade(label="表示", menu=view_menu)
+
+        self.configure(menu=menu_bar)
+
+    def open_output_folder(self) -> None:
+        output_folder = self.output_folder_var.get().strip()
+        if not output_folder:
+            messagebox.showwarning(APP_TITLE, "出力フォルダを指定してください。")
+            return
+        path = Path(output_folder)
+        if not path.exists():
+            messagebox.showwarning(APP_TITLE, "出力フォルダがまだ存在しません。")
+            return
+        os.startfile(path)
+
+    def open_readme(self) -> None:
+        for candidate in (BASE_DIR / "README.txt", BASE_DIR / "README.md"):
+            if candidate.exists():
+                os.startfile(candidate)
+                return
+        os.startfile(BASE_DIR)
 
     def _add_path_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
@@ -1307,6 +1383,7 @@ class ZipPreprocessorApp(tk.Tk):
         self.phase_var.set("開始準備中")
         self.progress_var.set(0.0)
         self.progress_bar.configure(maximum=1.0)
+        self.status_progress_bar.configure(maximum=1.0)
         self.progress_text_var.set("ZIP完了 0 / 0 件 | 全体 0.0%")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -1361,7 +1438,9 @@ class ZipPreprocessorApp(tk.Tk):
                 elif kind == "progress":
                     maximum = float(payload.get("maximum", 1.0))
                     value = float(payload.get("value", 0.0))
-                    self.progress_bar.configure(maximum=max(1.0, maximum))
+                    maximum = max(1.0, maximum)
+                    self.progress_bar.configure(maximum=maximum)
+                    self.status_progress_bar.configure(maximum=maximum)
                     self.progress_var.set(value)
                     self.progress_text_var.set(str(payload.get("text", "")))
                     phase = str(payload.get("phase", "")).strip()
