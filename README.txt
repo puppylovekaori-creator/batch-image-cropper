@@ -4,11 +4,11 @@
 概要
 ----
 Windows 11 向けの、人物画像ZIPをローカルで前処理する GUI アプリです。
-ZIP を 1 件ずつ展開し、OpenCV の顔検出とブレ量から selected_candidate / review / exclude に機械分類します。
+ZIP を 1 件ずつ展開し、OpenCV の顔検出とブレ量から `候補 / 目検 / 除外` に機械分類します。
 
 重要:
-- selected_candidate は core確定ではありません。
-- review も人間確認対象です。
+- 候補は採用確定ではありません。
+- 目検も人間確認対象です。
 - 本人判定は絶対に自動確定しません。
 
 
@@ -26,7 +26,7 @@ ZIP を 1 件ずつ展開し、OpenCV の顔検出とブレ量から selected_ca
 1. run.bat をダブルクリックしてください。
 2. GUI が開いたら、各フォルダと閾値を設定してください。
 3. 必要なら「設定保存」で config.json に保存してください。
-4. 「処理開始」を押すと、入力ZIPフォルダ直下の .zip をファイル名昇順で処理します。
+4. 「処理開始」を押すと、入力ZIPフォルダ直下の `.zip` をファイル名昇順で処理します。
 
 
 初回セットアップ
@@ -45,41 +45,41 @@ py -3.14 -m pip install -r requirements.txt
 GUI項目説明
 -----------
 入力ZIPフォルダ:
-- 処理対象の .zip を置くフォルダです。
-- 直下の .zip のみ対象です。サブフォルダの .zip は拾いません。
+- 処理対象の `.zip` を置くフォルダです。
+- 直下の `.zip` のみ対象です。サブフォルダの `.zip` は拾いません。
 
 出力フォルダ:
-- ZIPごとの結果フォルダ、result.zip、logs フォルダを作成します。
+- ZIPごとの結果フォルダ、結果ZIP、`ログ` フォルダを作成します。
 - 入力ZIPフォルダと同じパスは指定できません。
 
 一時フォルダ:
 - ZIP 展開用の作業フォルダです。
 - ZIP ごとに個別のサブフォルダを自動生成します。
 
-処理済みZIP移動先フォルダ:
-- 「処理済みZIPをdoneへ移動」が ON のときだけ使います。
+処理済みZIP保存先:
+- 「処理済みZIPを保存先へ移動」が ON のときだけ使います。
 - 成功した ZIP だけ移動します。
 
-selected用 最小顔比率:
+候補用 最小顔比率:
 - 最大顔矩形面積 ÷ 画像全体面積 のしきい値です。
-- これ以上なら selected_candidate 候補に入りやすくなります。
+- これ以上なら候補に入りやすくなります。
 
-review用 最小顔比率:
-- これ未満の顔サイズは exclude 寄りになります。
-- selected用 より小さい値にしてください。
+目検用 最小顔比率:
+- これ未満の顔サイズは除外寄りになります。
+- 候補用より小さい値にしてください。
 
 ブレ閾値:
 - OpenCV の Laplacian 分散値です。
 - 値が大きいほど鮮明寄りです。
 
-contact sheet列数:
-- contact sheet の横並び列数です。
+一覧画像列数:
+- 一覧画像の横並び列数です。
 
 サムネイル幅:
-- contact sheet の各画像幅です。
+- 一覧画像の各画像幅です。
 
-処理済みZIPをdoneへ移動:
-- 成功した ZIP のみ done へ移動します。
+処理済みZIPを保存先へ移動:
+- 成功した ZIP のみ処理済み保存先へ移動します。
 - 失敗ZIPは入力フォルダに残します。
 
 一時フォルダを処理後削除:
@@ -90,9 +90,9 @@ contact sheet列数:
 - OFF の場合、同名結果フォルダが既にある ZIP はスキップします。
 - ON の場合、同名結果フォルダを削除して再作成します。
 
-exclude画像もコピーする:
-- ON の場合は exclude フォルダにも画像をコピーします。
-- OFF の場合でも report と contact sheet には exclude 情報を残します。
+除外画像もコピーする:
+- ON の場合は `除外` フォルダにも画像をコピーします。
+- OFF の場合でも判定レポートと一覧画像には除外情報を残します。
 
 処理開始:
 - バッチ処理を開始します。
@@ -112,72 +112,72 @@ exclude画像もコピーする:
 - 顔比率は「最大顔矩形面積 ÷ 画像面積」です。
 - ブレ値は Laplacian 分散です。
 
-selected_candidate:
+候補:
 - 正面顔を 1 つ検出
-- 顔比率が selected用 最小顔比率以上
+- 顔比率が候補用 最小顔比率以上
 - ブレ値がブレ閾値以上
 - 端寄りや極端な明暗でない
 
-review:
-- 顔はあるが selected_candidate には弱い
+目検:
+- 顔はあるが候補には弱い
 - 顔がやや小さい
 - ブレがやや強い
 - 顔が端寄り
 - 横顔や角度付き顔
 
-exclude:
+除外:
 - 顔なし
 - 複数顔
-- 顔が review 用しきい値未満
+- 顔が目検用しきい値未満
 - 強いブレ
-- 破損画像
+- 画像破損
 - 横顔候補でも小さすぎる、またはブレが強い
 
 注意:
 - この判定は機械的なふるい分けです。
-- selected_candidate に入っても本人確定ではありません。
-- review は捨て枠ではなく、人間確認候補です。
+- 候補に入っても本人確定ではありません。
+- 目検は捨て枠ではなく、人間確認候補です。
 
 
 処理内容
 --------
-1. 入力フォルダ内の .zip をファイル名昇順で処理します。
+1. 入力フォルダ内の `.zip` をファイル名昇順で処理します。
 2. ZIP を一時フォルダ配下の個別サブフォルダへ展開します。
 3. 画像を再帰走査します。
 4. 顔数、顔比率、ブレ量から分類します。
-5. selected_candidate / review / exclude に振り分けます。
-6. contact_sheet_all.jpg / contact_sheet_selected_candidate.jpg / contact_sheet_review.jpg を生成します。
-7. selection_report.txt を生成します。
-8. 結果フォルダ全体を ZIP 化して *_result.zip を作成します。
-9. 成功時のみ done フォルダへ元 ZIP を移動します。
+5. `候補 / 目検 / 除外` に振り分けます。
+6. `一覧_全画像.jpg / 一覧_候補.jpg / 一覧_目検.jpg` を生成します。
+7. `判定レポート.txt` を生成します。
+8. 結果フォルダ全体を ZIP 化して `*_result.zip` を作成します。
+9. 成功時のみ処理済み保存先へ元 ZIP を移動します。
 10. 設定に応じて一時フォルダを削除します。
 
 
 出力構成
 --------
 OutputFolder\
-  logs\
-    zip_preprocess_YYYYMMDD_HHMMSS.log
+  ログ\
+    処理ログ_YYYYMMDD_HHMMSS.log
   kaori_009\
-    selected_candidate\
-    review\
-    exclude\
-    contact_sheet_all.jpg
-    contact_sheet_selected_candidate.jpg
-    contact_sheet_review.jpg
-    contact_sheet_all_part002.jpg  など
-    selection_report.txt
+    候補\
+    目検\
+    除外\
+    一覧_全画像.jpg
+    一覧_候補.jpg
+    一覧_目検.jpg
+    一覧_全画像_002.jpg  など
+    判定レポート.txt
     kaori_009_result.zip
 
 補足:
-- contact sheet が大きくなりすぎる場合は、`contact_sheet_all_part002.jpg` のように自動分割されます。
+- 一覧画像が大きくなりすぎる場合は、`一覧_全画像_002.jpg` のように自動分割されます。
 
-selection_report.txt には次を出力します。
+判定レポート.txt には次を出力します。
 - 元ZIP名
 - 総画像数
-- selected_candidate数
-- review数
-- exclude数
+- 候補数
+- 目検数
+- 除外数
 - 各画像の分類理由
 - 顔数
 - 顔比率
@@ -189,7 +189,7 @@ selection_report.txt には次を出力します。
 
 ログ
 ----
-- OutputFolder\logs\ に日時付きログを出力します。
+- `OutputFolder\ログ\` に日時付きログを出力します。
 - GUIログ欄にも同じ内容を表示します。
 - 1ZIP で失敗しても全体処理は継続します。
 
@@ -197,8 +197,8 @@ selection_report.txt には次を出力します。
 よくあるエラーと対処
 --------------------
 1. OpenCV の読み込みに失敗しました
-- py -3 -m pip install -r requirements.txt を実行してください。
-- 複数 Python がある場合は py -3.14 -m pip install -r requirements.txt を試してください。
+- `py -3 -m pip install -r requirements.txt` を実行してください。
+- 複数 Python がある場合は `py -3.14 -m pip install -r requirements.txt` を試してください。
 
 2. 入力ZIPフォルダと出力フォルダを同じパスにはできません
 - 入力と出力を別フォルダにしてください。
@@ -209,13 +209,13 @@ selection_report.txt には次を出力します。
 
 4. 破損ZIPの可能性があります
 - ZIP が壊れているか、Windows 側で解凍できない形式の可能性があります。
-- ログと selection_report.txt を確認してください。
+- ログと判定レポートを確認してください。
 
-5. 顔検出が弱い / selected_candidate が少ない
-- selected用 最小顔比率を下げる
-- review用 最小顔比率を下げる
+5. 顔検出が弱い / 候補が少ない
+- 候補用 最小顔比率を下げる
+- 目検用 最小顔比率を下げる
 - ブレ閾値を下げる
-- ただし、下げるほど review / selected_candidate にノイズが増えます
+- ただし、下げるほど目検 / 候補にノイズが増えます
 
 6. 日本語ファイル名で一部名前が変わる
 - ZIP 内部の文字コードや Windows 禁止文字の都合で、安全側に名前を補正して展開する場合があります。

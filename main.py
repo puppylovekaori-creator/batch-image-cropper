@@ -54,12 +54,12 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DEFAULT_WINDOW_GEOMETRY = "1240x900"
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-LOG_FOLDER_NAME = "logs"
-REPORT_FILE_NAME = "selection_report.txt"
-CONTACT_SHEET_ALL = "contact_sheet_all.jpg"
-CONTACT_SHEET_SELECTED = "contact_sheet_selected_candidate.jpg"
-CONTACT_SHEET_REVIEW = "contact_sheet_review.jpg"
-CONTACT_SHEET_PART_TEMPLATE = "{stem}_part{page:03d}{suffix}"
+LOG_FOLDER_NAME = "ログ"
+REPORT_FILE_NAME = "判定レポート.txt"
+CONTACT_SHEET_ALL = "一覧_全画像.jpg"
+CONTACT_SHEET_SELECTED = "一覧_候補.jpg"
+CONTACT_SHEET_REVIEW = "一覧_目検.jpg"
+CONTACT_SHEET_PART_TEMPLATE = "{stem}_{page:03d}{suffix}"
 CONTACT_SHEET_MAX_PAGE_WIDTH = 16000
 CONTACT_SHEET_MAX_PAGE_HEIGHT = 16000
 CONTACT_SHEET_MAX_PAGE_PIXELS = 64_000_000
@@ -68,15 +68,20 @@ CATEGORY_SELECTED = "selected_candidate"
 CATEGORY_REVIEW = "review"
 CATEGORY_EXCLUDE = "exclude"
 CATEGORY_ORDER = [CATEGORY_SELECTED, CATEGORY_REVIEW, CATEGORY_EXCLUDE]
-CATEGORY_LABELS = {
-    CATEGORY_SELECTED: "selected_candidate",
-    CATEGORY_REVIEW: "review",
-    CATEGORY_EXCLUDE: "exclude",
+CATEGORY_NAMES = {
+    CATEGORY_SELECTED: "候補",
+    CATEGORY_REVIEW: "目検",
+    CATEGORY_EXCLUDE: "除外",
 }
 CATEGORY_BORDER_COLORS = {
     CATEGORY_SELECTED: (28, 135, 55),
     CATEGORY_REVIEW: (214, 151, 13),
     CATEGORY_EXCLUDE: (190, 45, 45),
+}
+FACE_MODE_NAMES = {
+    "frontal": "正面寄り",
+    "profile": "横顔寄り",
+    "none": "顔なし",
 }
 INVALID_WINDOWS_NAME_CHARS = set('<>:"/\\|?*')
 FONT_CANDIDATES = [
@@ -85,23 +90,23 @@ FONT_CANDIDATES = [
     Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "YuGothM.ttc",
 ]
 SHORT_REASON_LABELS = {
-    "frontal_face_clear": "正面1顔 / 鮮明",
-    "face_small_for_selected": "顔小さめ",
+    "frontal_face_clear": "候補向き / 顔1つ / ブレ少",
+    "face_small_for_selected": "顔が小さい",
     "slight_blur": "ややブレ",
     "face_near_edge": "顔位置が端寄り",
     "brightness_extreme": "明暗差大",
-    "profile_or_angle_face": "横顔・角度あり",
+    "profile_or_angle_face": "目検対象 / 横顔・角度あり",
     "no_face": "顔なし",
     "multiple_faces": "複数顔",
-    "face_too_small": "顔が小さすぎ",
-    "strong_blur": "強いブレ",
-    "broken_image": "破損画像",
-    "profile_face_too_small": "横顔候補だが小さい",
-    "profile_face_blurry": "横顔候補だがブレ大",
+    "face_too_small": "顔が小さい",
+    "strong_blur": "ブレ大",
+    "broken_image": "画像破損",
+    "profile_face_too_small": "顔が小さい / 横顔寄り",
+    "profile_face_blurry": "ブレ大 / 横顔寄り",
 }
 REASON_LABELS = {
     **SHORT_REASON_LABELS,
-    "copy_failed": "分類後コピー失敗",
+    "copy_failed": "振り分け先へのコピー失敗",
 }
 STOP_MESSAGE = "停止要求を受け付けました。現在のZIP処理完了後に安全停止します。"
 HEADLESS_OK_MESSAGE = "gui_ok"
@@ -109,11 +114,11 @@ ZIP_PROGRESS_PHASES: dict[str, tuple[float, float, str]] = {
     "extract": (0.00, 0.05, "ZIP展開中"),
     "scan": (0.05, 0.03, "画像一覧作成中"),
     "classify": (0.08, 0.77, "画像分類中"),
-    "contact_all": (0.85, 0.05, "contact sheet 作成中"),
-    "contact_selected": (0.90, 0.02, "selected_candidate sheet 作成中"),
-    "contact_review": (0.92, 0.02, "review sheet 作成中"),
-    "done_move": (0.94, 0.015, "done へ移動中"),
-    "report": (0.955, 0.015, "レポート作成中"),
+    "contact_all": (0.85, 0.05, "一覧画像作成中"),
+    "contact_selected": (0.90, 0.02, "候補一覧作成中"),
+    "contact_review": (0.92, 0.02, "目検一覧作成中"),
+    "done_move": (0.94, 0.015, "処理済み移動中"),
+    "report": (0.955, 0.015, "判定レポート作成中"),
     "archive": (0.97, 0.025, "結果ZIP作成中"),
     "cleanup": (0.995, 0.005, "後片付け中"),
 }
@@ -247,13 +252,13 @@ class RunLogger:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def info(self, message: str) -> None:
-        self._write("INFO", message)
+        self._write("情報", message)
 
     def warning(self, message: str) -> None:
-        self._write("WARN", message)
+        self._write("警告", message)
 
     def error(self, message: str) -> None:
-        self._write("ERROR", message)
+        self._write("エラー", message)
 
     def _write(self, level: str, message: str) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -302,7 +307,7 @@ class ZipBatchProcessor:
                 "kind": "progress",
                 "value": 0.0,
                 "maximum": max(1.0, float(len(zip_files))),
-                "text": f"0 / {len(zip_files)} ZIP | 0.0%",
+                "text": f"ZIP完了 0 / {len(zip_files)} 件 | 全体 0.0%",
                 "phase": "開始待ち",
                 "detail": "最初のZIPを待機しています",
             }
@@ -391,7 +396,7 @@ class ZipBatchProcessor:
 
         result_dir.mkdir(parents=True, exist_ok=True)
         for category in CATEGORY_ORDER:
-            (result_dir / category).mkdir(parents=True, exist_ok=True)
+            (result_dir / category_name(category)).mkdir(parents=True, exist_ok=True)
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f"{sanitize_path_part(zip_path.stem)}_", dir=str(temp_root)))
         result = ZipProcessResult(
@@ -443,13 +448,13 @@ class ZipBatchProcessor:
             selected_records = [record for record in result.records if record.category == CATEGORY_SELECTED]
             review_records = [record for record in result.records if record.category == CATEGORY_REVIEW]
 
-            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 0.0, "全画像 contact sheet")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 0.0, "一覧（全画像）を作成しています")
             self._create_contact_sheet_safe(
                 zip_name=zip_path.name,
                 result_errors=result.errors,
                 output_path=result_dir / CONTACT_SHEET_ALL,
                 records=result.records,
-                title="全画像 contact sheet",
+                title="一覧（全画像）",
                 progress_callback=lambda current, total: self._emit_contact_sheet_progress(
                     zip_index,
                     total_zip_count,
@@ -459,60 +464,60 @@ class ZipBatchProcessor:
                     "全画像",
                 ),
             )
-            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 1.0, "全画像 contact sheet 完了")
-            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 0.0, "selected_candidate contact sheet")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 1.0, "一覧（全画像）を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 0.0, "一覧（候補）を作成しています")
             self._create_contact_sheet_safe(
                 zip_name=zip_path.name,
                 result_errors=result.errors,
                 output_path=result_dir / CONTACT_SHEET_SELECTED,
                 records=selected_records,
-                title="selected_candidate contact sheet",
+                title="一覧（候補）",
                 progress_callback=lambda current, total: self._emit_contact_sheet_progress(
                     zip_index,
                     total_zip_count,
                     "contact_selected",
                     current,
                     total,
-                    "selected_candidate",
+                    "候補",
                 ),
             )
-            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 1.0, "selected_candidate contact sheet 完了")
-            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 0.0, "review contact sheet")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 1.0, "一覧（候補）を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 0.0, "一覧（目検）を作成しています")
             self._create_contact_sheet_safe(
                 zip_name=zip_path.name,
                 result_errors=result.errors,
                 output_path=result_dir / CONTACT_SHEET_REVIEW,
                 records=review_records,
-                title="review contact sheet",
+                title="一覧（目検）",
                 progress_callback=lambda current, total: self._emit_contact_sheet_progress(
                     zip_index,
                     total_zip_count,
                     "contact_review",
                     current,
                     total,
-                    "review",
+                    "目検",
                 ),
             )
-            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 1.0, "review contact sheet 完了")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 1.0, "一覧（目検）を作成しました")
             result.success = True
 
             if self.config.move_done_zip:
                 try:
-                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 0.2, "成功した ZIP を done へ移動しています")
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 0.2, "成功した ZIP を処理済み保存先へ移動しています")
                     moved_path = self._move_to_done(zip_path)
-                    self.logger.info(f"{zip_path.name}: 処理成功のため done へ移動しました。{moved_path.name}")
-                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, f"done へ移動完了: {moved_path.name}")
+                    self.logger.info(f"{zip_path.name}: 処理成功のため処理済み保存先へ移動しました。{moved_path.name}")
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, f"処理済み保存先へ移動しました: {moved_path.name}")
                 except Exception as exc:
-                    error_message = f"{zip_path.name}: done への移動に失敗しました。入力フォルダに残します。{exc}"
+                    error_message = f"{zip_path.name}: 処理済み保存先への移動に失敗しました。入力フォルダに残します。{exc}"
                     result.errors.append(error_message)
                     self.logger.error(error_message)
-                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "done 移動失敗。入力側に残します")
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "処理済み保存先への移動に失敗しました")
             else:
-                self.logger.info(f"{zip_path.name}: done 移動は無効設定のため移動していません。")
-                self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "done 移動なし")
-            self._emit_phase_progress(zip_index, total_zip_count, "report", 0.2, "selection_report.txt を作成しています")
+                self.logger.info(f"{zip_path.name}: 処理済み保存先への移動は無効設定のため実行していません。")
+                self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "処理済み保存先への移動は行いません")
+            self._emit_phase_progress(zip_index, total_zip_count, "report", 0.2, f"{REPORT_FILE_NAME} を作成しています")
             self._write_selection_report(result)
-            self._emit_phase_progress(zip_index, total_zip_count, "report", 1.0, "selection_report.txt を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "report", 1.0, f"{REPORT_FILE_NAME} を作成しました")
             self._emit_phase_progress(zip_index, total_zip_count, "archive", 0.0, "結果フォルダを ZIP 化しています")
             archive_path = self._create_result_zip(
                 result_dir,
@@ -547,7 +552,9 @@ class ZipBatchProcessor:
             if not result.success:
                 self.logger.warning(f"{zip_path.name}: 処理は失敗扱いで完了しました。次のZIPへ進みます。")
             else:
-                self.logger.info(f"{zip_path.name}: 処理完了。selected={result.selected_count}, review={result.review_count}, exclude={result.exclude_count}")
+                self.logger.info(
+                    f"{zip_path.name}: 処理完了。候補={result.selected_count}, 目検={result.review_count}, 除外={result.exclude_count}"
+                )
         return result
 
     def _emit_phase_progress(
@@ -605,7 +612,7 @@ class ZipBatchProcessor:
         maximum = max(1.0, float(total_zip_count))
         percent = min(100.0, max(0.0, (value / maximum) * 100.0))
         completed_zip_count = min(total_zip_count, max(0, int(value)))
-        return f"完了 {completed_zip_count} / {total_zip_count} ZIP | 全体 {percent:.1f}%"
+        return f"ZIP完了 {completed_zip_count} / {total_zip_count} 件 | 全体 {percent:.1f}%"
 
     def _extract_zip(self, zip_path: Path, destination_dir: Path) -> None:
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -756,7 +763,7 @@ class ZipBatchProcessor:
         if record.category == CATEGORY_EXCLUDE and not self.config.copy_exclude_images:
             return
 
-        category_dir = result_dir / record.category
+        category_dir = result_dir / category_name(record.category)
         relative_path = Path(record.relative_path)
         destination_path = category_dir / relative_path
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -765,7 +772,7 @@ class ZipBatchProcessor:
             record.copied_path = destination_path
         except Exception as exc:
             record.reason_codes.append("copy_failed")
-            error_message = f"{record.relative_path}: 分類先へのコピーに失敗しました。{exc}"
+            error_message = f"{record.relative_path}: {category_name(record.category)} フォルダへのコピーに失敗しました。{exc}"
             error_messages.append(error_message)
             self.logger.error(error_message)
 
@@ -793,7 +800,7 @@ class ZipBatchProcessor:
         effective_columns = min(columns, max(1, CONTACT_SHEET_MAX_PAGE_WIDTH // max(1, tile_width)))
         if effective_columns < columns:
             self.logger.warning(
-                f"{output_path.name}: 幅が大きすぎるため、contact sheet 列数を {columns} から {effective_columns} に調整しました。"
+                f"{output_path.name}: 幅が大きすぎるため、一覧画像列数を {columns} から {effective_columns} に調整しました。"
             )
 
         if not records:
@@ -814,7 +821,7 @@ class ZipBatchProcessor:
         page_count = (len(records) + records_per_page - 1) // records_per_page
         if page_count > 1:
             self.logger.warning(
-                f"{output_path.name}: 画像 {len(records)} 枚のため、contact sheet を {page_count} 分割で出力します。"
+                f"{output_path.name}: 画像 {len(records)} 枚のため、一覧画像を {page_count} 分割で出力します。"
             )
 
         output_paths: list[Path] = []
@@ -886,40 +893,40 @@ class ZipBatchProcessor:
             try:
                 write_contact_sheet_error_notice(output_path, title, str(exc))
             except Exception as notice_exc:
-                self.logger.error(f"{zip_name}: contact sheet エラー通知画像の作成にも失敗しました。{notice_exc}")
+                self.logger.error(f"{zip_name}: 一覧画像エラー通知の作成にも失敗しました。{notice_exc}")
 
     def _write_selection_report(self, result: ZipProcessResult) -> None:
         report_path = result.result_dir / REPORT_FILE_NAME
         started = result.started_at.strftime("%Y-%m-%d %H:%M:%S")
         finished = (result.finished_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
         config_lines = [
-            f"InputZipFolder: {self.config.input_zip_folder}",
-            f"OutputFolder: {self.config.output_folder}",
-            f"TempFolder: {self.config.temp_folder}",
-            f"DoneFolder: {self.config.done_folder}",
-            f"SelectedMinFaceRatio: {self.config.selected_min_face_ratio:.4f}",
-            f"ReviewMinFaceRatio: {self.config.review_min_face_ratio:.4f}",
-            f"BlurThreshold: {self.config.blur_threshold:.2f}",
-            f"ContactSheetColumns: {self.config.contact_sheet_columns}",
-            f"ThumbnailWidth: {self.config.thumbnail_width}",
-            f"MoveDoneZip: {self.config.move_done_zip}",
-            f"DeleteTempFolder: {self.config.delete_temp_folder}",
-            f"OverwriteOutput: {self.config.overwrite_output}",
-            f"CopyExcludeImages: {self.config.copy_exclude_images}",
+            f"入力ZIPフォルダ: {self.config.input_zip_folder}",
+            f"出力フォルダ: {self.config.output_folder}",
+            f"一時フォルダ: {self.config.temp_folder}",
+            f"処理済みZIP保存先: {self.config.done_folder}",
+            f"候補用 最小顔比率: {self.config.selected_min_face_ratio:.4f}",
+            f"目検用 最小顔比率: {self.config.review_min_face_ratio:.4f}",
+            f"ブレ閾値: {self.config.blur_threshold:.2f}",
+            f"一覧画像列数: {self.config.contact_sheet_columns}",
+            f"サムネイル幅: {self.config.thumbnail_width}",
+            f"処理済みZIPを移動: {bool_to_japanese(self.config.move_done_zip)}",
+            f"一時フォルダを削除: {bool_to_japanese(self.config.delete_temp_folder)}",
+            f"既存出力を上書き: {bool_to_japanese(self.config.overwrite_output)}",
+            f"除外画像もコピー: {bool_to_japanese(self.config.copy_exclude_images)}",
         ]
 
         lines = [
             "人物画像ZIP前処理レポート",
-            "注意: selected_candidate は core確定ではありません。review も人間確認対象です。本人判定は自動確定しません。",
+            "注意: 候補は採用確定ではありません。目検も人間確認対象です。本人判定は自動確定しません。",
             "",
             f"元ZIP名: {result.zip_name}",
             f"開始時刻: {started}",
             f"終了時刻: {finished}",
             f"処理成功: {'はい' if result.success else 'いいえ'}",
             f"総画像数: {result.total_images}",
-            f"selected_candidate数: {result.selected_count}",
-            f"review数: {result.review_count}",
-            f"exclude数: {result.exclude_count}",
+            f"候補数: {result.selected_count}",
+            f"目検数: {result.review_count}",
+            f"除外数: {result.exclude_count}",
             "",
             "使用設定:",
             *config_lines,
@@ -936,27 +943,23 @@ class ZipBatchProcessor:
         lines.extend(
             [
                 "",
-                "各画像の分類結果:",
+                "各画像の判定結果:",
             ]
         )
 
         if result.records:
             for record in result.records:
-                lines.extend(
-                    [
-                        f"画像: {record.relative_path}",
-                        f"  分類: {record.category}",
-                        f"  分類理由: {record.reason_text}",
-                        f"  顔数: {record.face_count}",
-                        f"  顔検出モード: {record.face_mode}",
-                        f"  顔比率: {record.face_ratio:.4f}",
-                        f"  ブレ値: {record.blur_value:.2f}",
-                        f"  明るさ平均: {record.brightness:.2f}",
-                        "",
-                    ]
+                lines.append(
+                    f"{record.relative_path} : {category_name(record.category)} / "
+                    f"{record.reason_text} / "
+                    f"{face_count_label(record.face_count)} / "
+                    f"顔検出={face_mode_name(record.face_mode)} / "
+                    f"顔比率={record.face_ratio:.4f} / "
+                    f"ブレ値={record.blur_value:.2f} / "
+                    f"明るさ={record.brightness:.2f}"
                 )
         else:
-            lines.append("画像が見つからなかったため、画像別の分類結果はありません。")
+            lines.append("画像が見つからなかったため、画像別の判定結果はありません。")
 
         with report_path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(WINDOWS_NEWLINE.join(lines) + WINDOWS_NEWLINE)
@@ -999,7 +1002,7 @@ class ZipBatchProcessor:
                 time.sleep(0.4)
         if last_error is not None:
             raise last_error
-        raise RuntimeError("done への移動に失敗しました。")
+        raise RuntimeError("処理済み保存先への移動に失敗しました。")
 
 
 class ZipPreprocessorApp(tk.Tk):
@@ -1028,7 +1031,7 @@ class ZipPreprocessorApp(tk.Tk):
         self.copy_exclude_images_var = tk.BooleanVar(value=False)
         self.current_zip_var = tk.StringVar(value="待機中")
         self.phase_var = tk.StringVar(value="待機中")
-        self.progress_text_var = tk.StringVar(value="0 / 0 ZIP")
+        self.progress_text_var = tk.StringVar(value="ZIP完了 0 / 0 件 | 全体 0.0%")
         self.status_var = tk.StringVar(value="待機中")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_max_var = tk.DoubleVar(value=1.0)
@@ -1052,27 +1055,27 @@ class ZipPreprocessorApp(tk.Tk):
         self._add_path_row(path_group, 0, "入力ZIPフォルダ", self.input_zip_folder_var)
         self._add_path_row(path_group, 1, "出力フォルダ", self.output_folder_var)
         self._add_path_row(path_group, 2, "一時フォルダ", self.temp_folder_var)
-        self._add_path_row(path_group, 3, "処理済みZIP移動先", self.done_folder_var)
+        self._add_path_row(path_group, 3, "処理済みZIP保存先", self.done_folder_var)
 
         settings_group = ttk.LabelFrame(root_frame, text="判定設定", padding=12)
         settings_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         for column in range(4):
             settings_group.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
 
-        self._add_entry_row(settings_group, 0, 0, "selected用 最小顔比率", self.selected_min_face_ratio_var)
-        self._add_entry_row(settings_group, 0, 2, "review用 最小顔比率", self.review_min_face_ratio_var)
+        self._add_entry_row(settings_group, 0, 0, "候補用 最小顔比率", self.selected_min_face_ratio_var)
+        self._add_entry_row(settings_group, 0, 2, "目検用 最小顔比率", self.review_min_face_ratio_var)
         self._add_entry_row(settings_group, 1, 0, "ブレ閾値", self.blur_threshold_var)
-        self._add_entry_row(settings_group, 1, 2, "contact sheet列数", self.contact_sheet_columns_var)
+        self._add_entry_row(settings_group, 1, 2, "一覧画像列数", self.contact_sheet_columns_var)
         self._add_entry_row(settings_group, 2, 0, "サムネイル幅", self.thumbnail_width_var)
 
         check_frame = ttk.Frame(settings_group)
         check_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         check_frame.columnconfigure(0, weight=1)
         check_frame.columnconfigure(1, weight=1)
-        ttk.Checkbutton(check_frame, text="処理済みZIPをdoneへ移動", variable=self.move_done_zip_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(check_frame, text="処理済みZIPを保存先へ移動", variable=self.move_done_zip_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(check_frame, text="一時フォルダを処理後削除", variable=self.delete_temp_folder_var).grid(row=0, column=1, sticky="w")
         ttk.Checkbutton(check_frame, text="既存出力を上書き", variable=self.overwrite_output_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(check_frame, text="exclude画像もコピーする", variable=self.copy_exclude_images_var).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(check_frame, text="除外画像もコピーする", variable=self.copy_exclude_images_var).grid(row=1, column=1, sticky="w", pady=(4, 0))
 
         action_group = ttk.LabelFrame(root_frame, text="実行", padding=12)
         action_group.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
@@ -1096,7 +1099,7 @@ class ZipPreprocessorApp(tk.Tk):
         status_frame = ttk.Frame(action_group)
         status_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         status_frame.columnconfigure(1, weight=1)
-        ttk.Label(status_frame, text="現在処理中ZIP").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_frame, text="現在処理中").grid(row=0, column=0, sticky="w")
         ttk.Label(status_frame, textvariable=self.current_zip_var).grid(row=0, column=1, sticky="w", padx=(10, 0))
         ttk.Label(status_frame, text="状態").grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Label(status_frame, textvariable=self.status_var).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
@@ -1218,7 +1221,7 @@ class ZipPreprocessorApp(tk.Tk):
         if not temp_folder:
             raise ValueError("一時フォルダを指定してください。")
         if self.move_done_zip_var.get() and not done_folder:
-            raise ValueError("処理済みZIP移動先フォルダを指定してください。")
+            raise ValueError("処理済みZIP保存先フォルダを指定してください。")
 
         input_path = Path(input_zip_folder)
         output_path = Path(output_folder)
@@ -1232,7 +1235,7 @@ class ZipPreprocessorApp(tk.Tk):
         if same_path(input_path, temp_path):
             raise ValueError("入力ZIPフォルダと一時フォルダは別にしてください。")
         if done_path is not None and same_path(input_path, done_path):
-            raise ValueError("入力ZIPフォルダと done フォルダは別にしてください。")
+            raise ValueError("入力ZIPフォルダと処理済みZIP保存先フォルダは別にしてください。")
 
         selected_min_face_ratio = _safe_float(self.selected_min_face_ratio_var.get(), -1.0)
         review_min_face_ratio = _safe_float(self.review_min_face_ratio_var.get(), -1.0)
@@ -1241,15 +1244,15 @@ class ZipPreprocessorApp(tk.Tk):
         thumbnail_width = _safe_int(self.thumbnail_width_var.get(), -1)
 
         if not (0.0 < selected_min_face_ratio <= 1.0):
-            raise ValueError("selected用 最小顔比率は 0 より大きく 1 以下で指定してください。")
+            raise ValueError("候補用 最小顔比率は 0 より大きく 1 以下で指定してください。")
         if not (0.0 < review_min_face_ratio <= 1.0):
-            raise ValueError("review用 最小顔比率は 0 より大きく 1 以下で指定してください。")
+            raise ValueError("目検用 最小顔比率は 0 より大きく 1 以下で指定してください。")
         if selected_min_face_ratio < review_min_face_ratio:
-            raise ValueError("selected用 最小顔比率は review用 以上にしてください。")
+            raise ValueError("候補用 最小顔比率は 目検用 以上にしてください。")
         if blur_threshold <= 0.0:
             raise ValueError("ブレ閾値は 0 より大きい値にしてください。")
         if contact_sheet_columns <= 0:
-            raise ValueError("contact sheet列数は 1 以上にしてください。")
+            raise ValueError("一覧画像列数は 1 以上にしてください。")
         if thumbnail_width < 120:
             raise ValueError("サムネイル幅は 120 以上にしてください。")
 
@@ -1295,7 +1298,7 @@ class ZipPreprocessorApp(tk.Tk):
         self.save_config(silent=True)
         Path(config.output_folder).mkdir(parents=True, exist_ok=True)
         log_dir = Path(config.output_folder) / LOG_FOLDER_NAME
-        log_name = f"zip_preprocess_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_name = f"処理ログ_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         self.current_log_path = log_dir / log_name
 
         self.stop_event.clear()
@@ -1304,7 +1307,7 @@ class ZipPreprocessorApp(tk.Tk):
         self.phase_var.set("開始準備中")
         self.progress_var.set(0.0)
         self.progress_bar.configure(maximum=1.0)
-        self.progress_text_var.set("0 / 0 ZIP | 0.0%")
+        self.progress_text_var.set("ZIP完了 0 / 0 件 | 全体 0.0%")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.save_button.configure(state="disabled")
@@ -1331,7 +1334,7 @@ class ZipPreprocessorApp(tk.Tk):
             processor = ZipBatchProcessor(config=config, stop_event=self.stop_event, ui_sender=self._send_ui_message, logger=logger)
             summary = processor.run()
             logger.info(
-                f"全体完了: processed={summary.processed_zip_count}, success={summary.success_zip_count}, failed={summary.failed_zip_count}, skipped={summary.skipped_zip_count}, stopped={summary.stopped}"
+                f"全体完了: 処理ZIP数={summary.processed_zip_count}, 成功={summary.success_zip_count}, 失敗={summary.failed_zip_count}, スキップ={summary.skipped_zip_count}, 停止={bool_to_japanese(summary.stopped)}"
             )
             self._send_ui_message({"kind": "finish", "summary": summary})
         except Exception as exc:
@@ -1388,7 +1391,7 @@ class ZipPreprocessorApp(tk.Tk):
             elif summary.stopped:
                 self.status_var.set("停止完了")
             else:
-                self.status_var.set("完了")
+                self.status_var.set("処理完了")
 
             if fatal_error:
                 messagebox.showerror(APP_TITLE, f"処理が致命的エラーで終了しました。{fatal_error}")
@@ -1405,7 +1408,7 @@ class ZipPreprocessorApp(tk.Tk):
                     message_lines.append(f"ログ: {summary.log_file_path}")
                 messagebox.showinfo(APP_TITLE, WINDOWS_NEWLINE.join(message_lines))
         else:
-            self.status_var.set("完了")
+            self.status_var.set("処理完了")
 
         self.current_zip_var.set("待機中")
         self.phase_var.set("待機中")
@@ -1446,6 +1449,26 @@ def _safe_bool(value: object) -> bool:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
+
+
+def bool_to_japanese(value: bool) -> str:
+    return "はい" if value else "いいえ"
+
+
+def category_name(category: str) -> str:
+    return CATEGORY_NAMES.get(category, category)
+
+
+def face_mode_name(face_mode: str) -> str:
+    return FACE_MODE_NAMES.get(face_mode, face_mode)
+
+
+def face_count_label(face_count: int) -> str:
+    if face_count <= 0:
+        return "顔なし"
+    if face_count == 1:
+        return "顔1つ"
+    return f"顔{face_count}つ"
 
 
 def should_emit_progress_update(current: int, total: int, target_updates: int = 200) -> bool:
@@ -1581,7 +1604,7 @@ def make_thumbnail_image(image_path: Path, thumb_width: int, thumb_height: int) 
     if ImageDraw is not None and ImageFont is not None:
         draw = ImageDraw.Draw(placeholder)
         font = load_contact_font(14)
-        draw.multiline_text((12, 14), "NO\nPREVIEW", fill=(120, 120, 120), font=font, spacing=2)
+        draw.multiline_text((12, 14), "画像\nなし", fill=(120, 120, 120), font=font, spacing=2)
 
     try:
         image = load_rgb_image(image_path)
@@ -1611,7 +1634,7 @@ def write_contact_sheet_error_notice(output_path: Path, title: str, error_messag
     title_font = load_contact_font(22)
     body_font = load_contact_font(16)
     draw.text((24, 20), f"{title} の作成に失敗しました", fill=(160, 30, 30), font=title_font)
-    lines = textwrap.wrap(error_message, width=88) or ["unknown error"]
+    lines = textwrap.wrap(error_message, width=88) or ["不明なエラー"]
     draw.multiline_text((24, 70), "\n".join(lines[:6]), fill=(60, 60, 60), font=body_font, spacing=4)
     save_contact_sheet(canvas, output_path)
 
