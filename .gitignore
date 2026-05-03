@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 .runtime_cache/
 New-FfmpegFrameExtractCommandGui.settings.json
+logs/
