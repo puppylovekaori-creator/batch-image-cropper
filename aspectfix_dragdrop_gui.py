@@ -46,7 +46,7 @@ DEFAULT_WINDOW_GEOMETRY = "1560x980"
 DEFAULT_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
 INVALID_FILE_NAME_CHARS = set('<>:"/\\|?*')
 DROP_MESSAGE = "ここに画像ファイルをドラッグ＆ドロップ"
-DROP_FALLBACK_MESSAGE = "ドラッグ＆ドロップを使うには requirements.txt のインストールが必要です"
+DROP_FALLBACK_MESSAGE = "ドラッグ＆ドロップを使うには requirements_aspectfix.txt のインストールが必要です"
 PREVIEW_BOX_SIZE = (760, 720)
 
 STATUS_WAITING = "待機"
