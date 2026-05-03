@@ -1,0 +1,25 @@
+{
+  "OutputFolder": "C:\\output_aspect_fixed",
+  "RecursiveFolderDrop": true,
+  "KeepFolderStructureWhenFolderAdded": false,
+  "Extensions": [
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp"
+  ],
+  "Mode": "manual_scale",
+  "XScale": 0.95,
+  "YScale": 1.0,
+  "TargetAspectRatio": "16:9",
+  "OutputCanvasMode": "blur_background",
+  "OutputFormat": "keep_original",
+  "Suffix": "_aspectfix",
+  "JpegQuality": 95,
+  "WebpQuality": 95,
+  "Interpolation": "lanczos",
+  "Overwrite": false,
+  "DeleteSource": false,
+  "WindowGeometry": "1560x980"
+}

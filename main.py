@@ -2,229 +2,250 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
+import shutil
+import tempfile
+import textwrap
 import threading
+import time
 import traceback
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 try:
-    from PIL import Image, ImageFilter, ImageOps, ImageTk, UnidentifiedImageError
+    import numpy as np
+
+    NUMPY_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - depends on environment
+    np = None  # type: ignore[assignment]
+    NUMPY_IMPORT_ERROR = exc
+
+try:
+    import cv2
+
+    CV2_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - depends on environment
+    cv2 = None  # type: ignore[assignment]
+    CV2_IMPORT_ERROR = exc
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
     PIL_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - depends on environment
     Image = None  # type: ignore[assignment]
-    ImageFilter = None  # type: ignore[assignment]
+    ImageDraw = None  # type: ignore[assignment]
+    ImageFont = None  # type: ignore[assignment]
     ImageOps = None  # type: ignore[assignment]
-    ImageTk = None  # type: ignore[assignment]
     UnidentifiedImageError = OSError  # type: ignore[assignment]
     PIL_IMPORT_ERROR = exc
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
 
-    TKDND_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - optional dependency
-    DND_FILES = None  # type: ignore[assignment]
-    TkinterDnD = None  # type: ignore[assignment]
-    TKDND_IMPORT_ERROR = exc
-
-
-APP_TITLE = "画像アスペクト補正ツール"
-HEADLESS_OK_MESSAGE = "gui_ok"
+APP_TITLE = "人物画像ZIP前処理 GUI"
 WINDOWS_NEWLINE = "\r\n"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
-LOG_FOLDER_NAME = "logs"
-REPORT_FILE_PREFIX = "aspectfix_report_"
-DEFAULT_WINDOW_GEOMETRY = "1560x980"
-DEFAULT_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
-INVALID_FILE_NAME_CHARS = set('<>:"/\\|?*')
-DROP_MESSAGE = "ここに画像ファイルをドラッグ＆ドロップ"
-DROP_FALLBACK_MESSAGE = "ドラッグ＆ドロップを使うには requirements.txt のインストールが必要です"
-PREVIEW_BOX_SIZE = (500, 420)
-
-STATUS_WAITING = "待機"
-STATUS_READY = "準備完了"
-STATUS_PROCESSING = "処理中"
-STATUS_DONE = "完了"
-STATUS_FAILED = "失敗"
-STATUS_SKIPPED = "スキップ"
-STATUS_STOPPED = "停止"
-
-MODE_LABELS = {
-    "manual_scale": "手動倍率補正",
+DEFAULT_WINDOW_GEOMETRY = "1240x900"
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+LOG_FOLDER_NAME = "ログ"
+REPORT_FILE_NAME = "判定レポート.txt"
+CONTACT_SHEET_ALL = "一覧_全画像.jpg"
+CONTACT_SHEET_SELECTED = "一覧_候補.jpg"
+CONTACT_SHEET_REVIEW = "一覧_目検.jpg"
+CONTACT_SHEET_PART_TEMPLATE = "{stem}_{page:03d}{suffix}"
+CONTACT_SHEET_MAX_PAGE_WIDTH = 16000
+CONTACT_SHEET_MAX_PAGE_HEIGHT = 16000
+CONTACT_SHEET_MAX_PAGE_PIXELS = 64_000_000
+RESULT_ZIP_SUFFIX = "_result.zip"
+CATEGORY_SELECTED = "selected_candidate"
+CATEGORY_REVIEW = "review"
+CATEGORY_EXCLUDE = "exclude"
+CATEGORY_ORDER = [CATEGORY_SELECTED, CATEGORY_REVIEW, CATEGORY_EXCLUDE]
+CATEGORY_NAMES = {
+    CATEGORY_SELECTED: "候補",
+    CATEGORY_REVIEW: "目検",
+    CATEGORY_EXCLUDE: "除外",
 }
-CANVAS_MODE_LABELS = {
-    "blur_background": "ぼかし背景",
-    "solid_black": "黒背景",
-    "solid_white": "白背景",
+CATEGORY_BORDER_COLORS = {
+    CATEGORY_SELECTED: (28, 135, 55),
+    CATEGORY_REVIEW: (214, 151, 13),
+    CATEGORY_EXCLUDE: (190, 45, 45),
 }
-OUTPUT_FORMAT_LABELS = {
-    "keep_original": "元拡張子で保存",
-    "jpeg": "JPEGで保存",
-    "png": "PNGで保存",
-    "webp": "WebPで保存",
+FACE_MODE_NAMES = {
+    "frontal": "正面寄り",
+    "profile": "横顔寄り",
+    "none": "顔なし",
 }
-INTERPOLATION_LABELS = {
-    "lanczos": "高品質補間",
-    "bicubic": "なめらか補間",
-    "bilinear": "標準補間",
-    "nearest": "最近傍補間",
+INVALID_WINDOWS_NAME_CHARS = set('<>:"/\\|?*')
+FONT_CANDIDATES = [
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "meiryo.ttc",
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msgothic.ttc",
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "YuGothM.ttc",
+]
+SHORT_REASON_LABELS = {
+    "frontal_face_clear": "候補向き / 顔1つ / ブレ少",
+    "face_small_for_selected": "顔が小さい",
+    "slight_blur": "ややブレ",
+    "face_near_edge": "顔位置が端寄り",
+    "brightness_extreme": "明暗差大",
+    "profile_or_angle_face": "目検対象 / 横顔・角度あり",
+    "no_face": "顔なし",
+    "multiple_faces": "複数顔",
+    "face_too_small": "顔が小さい",
+    "strong_blur": "ブレ大",
+    "broken_image": "画像破損",
+    "profile_face_too_small": "顔が小さい / 横顔寄り",
+    "profile_face_blurry": "ブレ大 / 横顔寄り",
 }
-
-MODE_LABEL_TO_KEY = {label: key for key, label in MODE_LABELS.items()}
-CANVAS_MODE_LABEL_TO_KEY = {label: key for key, label in CANVAS_MODE_LABELS.items()}
-OUTPUT_FORMAT_LABEL_TO_KEY = {label: key for key, label in OUTPUT_FORMAT_LABELS.items()}
-INTERPOLATION_LABEL_TO_KEY = {label: key for key, label in INTERPOLATION_LABELS.items()}
+REASON_LABELS = {
+    **SHORT_REASON_LABELS,
+    "copy_failed": "振り分け先へのコピー失敗",
+}
+STOP_MESSAGE = "停止要求を受け付けました。現在のZIP処理完了後に安全停止します。"
+HEADLESS_OK_MESSAGE = "gui_ok"
+ZIP_PROGRESS_PHASES: dict[str, tuple[float, float, str]] = {
+    "extract": (0.00, 0.05, "ZIP展開中"),
+    "scan": (0.05, 0.03, "画像一覧作成中"),
+    "classify": (0.08, 0.77, "画像分類中"),
+    "contact_all": (0.85, 0.05, "一覧画像作成中"),
+    "contact_selected": (0.90, 0.02, "候補一覧作成中"),
+    "contact_review": (0.92, 0.02, "目検一覧作成中"),
+    "done_move": (0.94, 0.015, "処理済み移動中"),
+    "report": (0.955, 0.015, "判定レポート作成中"),
+    "archive": (0.97, 0.025, "結果ZIP作成中"),
+    "cleanup": (0.995, 0.005, "後片付け中"),
+}
 
 if Image is not None:
     try:
-        RESAMPLE_NEAREST = Image.Resampling.NEAREST
-        RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
-        RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
         RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
     except AttributeError:  # pragma: no cover - Pillow compatibility fallback
-        RESAMPLE_NEAREST = Image.NEAREST
-        RESAMPLE_BILINEAR = Image.BILINEAR
-        RESAMPLE_BICUBIC = Image.BICUBIC
         RESAMPLE_LANCZOS = Image.LANCZOS
 else:  # pragma: no cover - depends on environment
-    RESAMPLE_NEAREST = None
-    RESAMPLE_BILINEAR = None
-    RESAMPLE_BICUBIC = None
     RESAMPLE_LANCZOS = None
-
-RESAMPLE_MAP = {
-    "nearest": RESAMPLE_NEAREST,
-    "bilinear": RESAMPLE_BILINEAR,
-    "bicubic": RESAMPLE_BICUBIC,
-    "lanczos": RESAMPLE_LANCZOS,
-}
-
-PIL_FORMAT_BY_EXTENSION = {
-    ".jpg": "JPEG",
-    ".jpeg": "JPEG",
-    ".png": "PNG",
-    ".webp": "WEBP",
-    ".bmp": "BMP",
-}
 
 
 @dataclass
 class AppConfig:
-    output_folder: str = r"C:\output_aspect_fixed"
-    recursive_folder_drop: bool = True
-    keep_folder_structure_when_folder_added: bool = False
-    extensions: list[str] = field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
-    mode: str = "manual_scale"
-    x_scale: float = 0.95
-    y_scale: float = 1.0
-    target_aspect_ratio: str = "16:9"
-    output_canvas_mode: str = "blur_background"
-    output_format: str = "keep_original"
-    suffix: str = "_aspectfix"
-    jpeg_quality: int = 95
-    webp_quality: int = 95
-    interpolation: str = "lanczos"
-    overwrite: bool = False
-    delete_source: bool = False
+    input_zip_folder: str = ""
+    output_folder: str = ""
+    temp_folder: str = ""
+    done_folder: str = ""
+    selected_min_face_ratio: float = 0.05
+    review_min_face_ratio: float = 0.018
+    blur_threshold: float = 90.0
+    contact_sheet_columns: int = 5
+    thumbnail_width: int = 220
+    move_done_zip: bool = True
+    delete_temp_folder: bool = True
+    overwrite_output: bool = False
+    copy_exclude_images: bool = False
     window_geometry: str = DEFAULT_WINDOW_GEOMETRY
 
     @classmethod
     def from_dict(cls, raw: object) -> "AppConfig":
         data = raw if isinstance(raw, dict) else {}
         return cls(
-            output_folder=_safe_string(data.get("OutputFolder", r"C:\output_aspect_fixed")),
-            recursive_folder_drop=_safe_bool(data.get("RecursiveFolderDrop", True)),
-            keep_folder_structure_when_folder_added=_safe_bool(data.get("KeepFolderStructureWhenFolderAdded", False)),
-            extensions=normalize_extensions(data.get("Extensions", DEFAULT_EXTENSIONS)),
-            mode=normalize_choice(_safe_string(data.get("Mode", "manual_scale")), MODE_LABELS, "manual_scale"),
-            x_scale=max(0.01, _safe_float(data.get("XScale", 0.95), 0.95)),
-            y_scale=max(0.01, _safe_float(data.get("YScale", 1.0), 1.0)),
-            target_aspect_ratio=_safe_string(data.get("TargetAspectRatio", "16:9")) or "16:9",
-            output_canvas_mode=normalize_choice(
-                _safe_string(data.get("OutputCanvasMode", "blur_background")),
-                CANVAS_MODE_LABELS,
-                "blur_background",
-            ),
-            output_format=normalize_choice(
-                _safe_string(data.get("OutputFormat", "keep_original")),
-                OUTPUT_FORMAT_LABELS,
-                "keep_original",
-            ),
-            suffix=_safe_string(data.get("Suffix", "_aspectfix")) or "_aspectfix",
-            jpeg_quality=_clamp_int(_safe_int(data.get("JpegQuality", 95), 95), 1, 100),
-            webp_quality=_clamp_int(_safe_int(data.get("WebpQuality", 95), 95), 1, 100),
-            interpolation=normalize_choice(
-                _safe_string(data.get("Interpolation", "lanczos")),
-                INTERPOLATION_LABELS,
-                "lanczos",
-            ),
-            overwrite=_safe_bool(data.get("Overwrite", False)),
-            delete_source=_safe_bool(data.get("DeleteSource", False)),
+            input_zip_folder=_safe_string(data.get("InputZipFolder", "")),
+            output_folder=_safe_string(data.get("OutputFolder", "")),
+            temp_folder=_safe_string(data.get("TempFolder", "")),
+            done_folder=_safe_string(data.get("DoneFolder", "")),
+            selected_min_face_ratio=_clamp(_safe_float(data.get("SelectedMinFaceRatio", 0.05), 0.05), 0.0001, 1.0),
+            review_min_face_ratio=_clamp(_safe_float(data.get("ReviewMinFaceRatio", 0.018), 0.018), 0.0001, 1.0),
+            blur_threshold=max(1.0, _safe_float(data.get("BlurThreshold", 90.0), 90.0)),
+            contact_sheet_columns=max(1, _safe_int(data.get("ContactSheetColumns", 5), 5)),
+            thumbnail_width=max(120, _safe_int(data.get("ThumbnailWidth", 220), 220)),
+            move_done_zip=_safe_bool(data.get("MoveDoneZip", True)),
+            delete_temp_folder=_safe_bool(data.get("DeleteTempFolder", True)),
+            overwrite_output=_safe_bool(data.get("OverwriteOutput", False)),
+            copy_exclude_images=_safe_bool(data.get("CopyExcludeImages", False)),
             window_geometry=_safe_string(data.get("WindowGeometry", DEFAULT_WINDOW_GEOMETRY)) or DEFAULT_WINDOW_GEOMETRY,
         )
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "InputZipFolder": self.input_zip_folder,
             "OutputFolder": self.output_folder,
-            "RecursiveFolderDrop": self.recursive_folder_drop,
-            "KeepFolderStructureWhenFolderAdded": self.keep_folder_structure_when_folder_added,
-            "Extensions": list(self.extensions),
-            "Mode": self.mode,
-            "XScale": self.x_scale,
-            "YScale": self.y_scale,
-            "TargetAspectRatio": self.target_aspect_ratio,
-            "OutputCanvasMode": self.output_canvas_mode,
-            "OutputFormat": self.output_format,
-            "Suffix": self.suffix,
-            "JpegQuality": self.jpeg_quality,
-            "WebpQuality": self.webp_quality,
-            "Interpolation": self.interpolation,
-            "Overwrite": self.overwrite,
-            "DeleteSource": self.delete_source,
+            "TempFolder": self.temp_folder,
+            "DoneFolder": self.done_folder,
+            "SelectedMinFaceRatio": self.selected_min_face_ratio,
+            "ReviewMinFaceRatio": self.review_min_face_ratio,
+            "BlurThreshold": self.blur_threshold,
+            "ContactSheetColumns": self.contact_sheet_columns,
+            "ThumbnailWidth": self.thumbnail_width,
+            "MoveDoneZip": self.move_done_zip,
+            "DeleteTempFolder": self.delete_temp_folder,
+            "OverwriteOutput": self.overwrite_output,
+            "CopyExcludeImages": self.copy_exclude_images,
             "WindowGeometry": self.window_geometry,
         }
 
 
 @dataclass
-class ProcessItem:
-    item_id: str
+class ImageRecord:
+    relative_path: str
+    category: str
+    reason_codes: list[str]
+    face_count: int
+    face_ratio: float
+    blur_value: float
+    face_mode: str
+    brightness: float
     source_path: Path
-    source_root: Path | None
-    added_via_folder: bool
-    original_size: tuple[int, int]
-    original_aspect_text: str
-    status: str = STATUS_READY
-    output_name: str = "-"
-    output_path: Path | None = None
-    output_size: tuple[int, int] | None = None
-    output_aspect_text: str = "-"
-    error_text: str = ""
-    processed_at: datetime | None = None
+    copied_path: Path | None = None
+
+    @property
+    def reason_text(self) -> str:
+        return join_reason_labels(self.reason_codes)
+
+    @property
+    def short_reason_text(self) -> str:
+        if not self.reason_codes:
+            return "-"
+        short_codes = self.reason_codes[:2]
+        return join_reason_labels(short_codes)
 
 
 @dataclass
-class BatchSummary:
+class ZipProcessResult:
+    zip_path: Path
+    zip_name: str
+    result_dir: Path
+    temp_dir: Path
     started_at: datetime
     finished_at: datetime | None = None
-    total_count: int = 0
-    success_count: int = 0
-    failure_count: int = 0
-    skip_count: int = 0
+    total_images: int = 0
+    selected_count: int = 0
+    review_count: int = 0
+    exclude_count: int = 0
+    success: bool = False
+    skipped: bool = False
+    records: list[ImageRecord] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchRunSummary:
+    started_at: datetime
+    finished_at: datetime | None = None
+    total_zip_count: int = 0
+    processed_zip_count: int = 0
+    success_zip_count: int = 0
+    failed_zip_count: int = 0
+    skipped_zip_count: int = 0
     stopped: bool = False
     log_file_path: Path | None = None
-    report_file_path: Path | None = None
 
 
 class RunLogger:
-    def __init__(self, log_path: Path, ui_sender: Callable[[dict[str, Any]], None]) -> None:
+    def __init__(self, log_path: Path, ui_sender: callable) -> None:
         self.log_path = log_path
         self._ui_sender = ui_sender
         self._lock = threading.Lock()
@@ -234,1464 +255,1420 @@ class RunLogger:
         self._write("情報", message)
 
     def warning(self, message: str) -> None:
-        self._write("注意", message)
+        self._write("警告", message)
 
     def error(self, message: str) -> None:
         self._write("エラー", message)
 
     def _write(self, level: str, message: str) -> None:
-        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] [{level}] {message}"
         with self._lock:
             with self.log_path.open("a", encoding="utf-8", newline="") as handle:
                 handle.write(line + WINDOWS_NEWLINE)
         self._ui_sender({"kind": "log", "line": line})
 
 
-if TkinterDnD is not None:
-    AppBase = TkinterDnD.Tk
-else:
-    AppBase = tk.Tk
-
-
-class AspectFixApp(AppBase):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title(APP_TITLE)
-        self.minsize(1320, 860)
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self.config_data = load_config()
-        self.ui_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.items: list[ProcessItem] = []
-        self.item_lookup: dict[str, ProcessItem] = {}
-        self.source_key_set: set[str] = set()
-        self.item_counter = 0
-        self.processing_thread: threading.Thread | None = None
-        self.stop_event = threading.Event()
-        self.current_summary: BatchSummary | None = None
-        self.current_logger: RunLogger | None = None
-        self.preview_before_photo: Any | None = None
-        self.preview_after_photo: Any | None = None
-        self._pending_output_refresh: str | None = None
-
-        self.output_folder_var = tk.StringVar()
-        self.recursive_folder_drop_var = tk.BooleanVar(value=True)
-        self.keep_structure_var = tk.BooleanVar(value=False)
-        self.extensions_var = tk.StringVar()
-        self.mode_var = tk.StringVar()
-        self.x_scale_var = tk.StringVar()
-        self.y_scale_var = tk.StringVar()
-        self.target_aspect_ratio_var = tk.StringVar()
-        self.output_canvas_mode_var = tk.StringVar()
-        self.output_format_var = tk.StringVar()
-        self.suffix_var = tk.StringVar()
-        self.jpeg_quality_var = tk.StringVar()
-        self.webp_quality_var = tk.StringVar()
-        self.interpolation_var = tk.StringVar()
-        self.overwrite_var = tk.BooleanVar(value=False)
-        self.delete_source_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="待機中")
-        self.progress_text_var = tk.StringVar(value="0 / 0 件")
-        self.selected_file_name_var = tk.StringVar(value="-")
-        self.selected_size_var = tk.StringVar(value="-")
-        self.selected_aspect_var = tk.StringVar(value="-")
-        self.corrected_size_var = tk.StringVar(value="-")
-        self.corrected_aspect_var = tk.StringVar(value="-")
-
-        self._build_ui()
-        self._load_config_into_vars(self.config_data)
-        self.geometry(self.config_data.window_geometry or DEFAULT_WINDOW_GEOMETRY)
-        self._register_drop_targets()
-        self._bind_var_traces()
-        self._schedule_output_refresh()
-        self.after(100, self._drain_ui_queue)
-
-        if TKDND_IMPORT_ERROR is not None:
-            self._append_log_line("ドラッグ＆ドロップは未有効です。ファイル追加ボタンは利用できます。")
-
-        if PIL_IMPORT_ERROR is not None:
-            self._append_log_line(f"Pillow の読み込みに失敗しています: {PIL_IMPORT_ERROR}")
-
-    def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
-        root.grid(row=0, column=0, sticky="nsew")
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=3)
-        root.rowconfigure(3, weight=1)
-
-        drop_frame = ttk.LabelFrame(root, text="画像追加", padding=12)
-        drop_frame.grid(row=0, column=0, sticky="ew")
-        drop_frame.columnconfigure(0, weight=1)
-        self.drop_label = tk.Label(
-            drop_frame,
-            text=DROP_MESSAGE,
-            relief="groove",
-            bd=2,
-            padx=16,
-            pady=34,
-            font=("Yu Gothic UI", 18, "bold"),
-            justify="center",
-            bg="#f4f7fb",
-            fg="#1d2d44",
-        )
-        self.drop_label.grid(row=0, column=0, sticky="ew")
-        self.drop_note_label = ttk.Label(drop_frame, text="")
-        self.drop_note_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self._update_drop_note()
-
-        settings_frame = ttk.LabelFrame(root, text="設定", padding=12)
-        settings_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        for column in range(6):
-            settings_frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
-
-        ttk.Label(settings_frame, text="出力フォルダ").grid(row=0, column=0, sticky="w")
-        self.output_folder_entry = ttk.Entry(settings_frame, textvariable=self.output_folder_var)
-        self.output_folder_entry.grid(row=0, column=1, columnspan=4, sticky="ew", padx=(8, 8))
-        self.output_folder_button = ttk.Button(settings_frame, text="出力フォルダ選択", command=self.select_output_folder)
-        self.output_folder_button.grid(row=0, column=5, sticky="ew")
-
-        ttk.Label(settings_frame, text="対象拡張子").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.extensions_entry = ttk.Entry(settings_frame, textvariable=self.extensions_var)
-        self.extensions_entry.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(8, 0), pady=(10, 0))
-
-        ttk.Label(settings_frame, text="補正モード").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        self.mode_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.mode_var,
-            values=list(MODE_LABELS.values()),
-            state="readonly",
-        )
-        self.mode_combo.grid(row=2, column=1, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(settings_frame, text="目標アスペクト比").grid(row=2, column=2, sticky="w", pady=(10, 0))
-        self.target_aspect_entry = ttk.Entry(settings_frame, textvariable=self.target_aspect_ratio_var)
-        self.target_aspect_entry.grid(row=2, column=3, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(settings_frame, text="出力方式").grid(row=2, column=4, sticky="w", pady=(10, 0))
-        self.output_canvas_mode_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.output_canvas_mode_var,
-            values=list(CANVAS_MODE_LABELS.values()),
-            state="readonly",
-        )
-        self.output_canvas_mode_combo.grid(row=2, column=5, sticky="ew", pady=(10, 0))
-
-        ttk.Label(settings_frame, text="横倍率").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        self.x_scale_entry = ttk.Entry(settings_frame, textvariable=self.x_scale_var)
-        self.x_scale_entry.grid(row=3, column=1, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(settings_frame, text="縦倍率").grid(row=3, column=2, sticky="w", pady=(10, 0))
-        self.y_scale_entry = ttk.Entry(settings_frame, textvariable=self.y_scale_var)
-        self.y_scale_entry.grid(row=3, column=3, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(settings_frame, text="出力形式").grid(row=3, column=4, sticky="w", pady=(10, 0))
-        self.output_format_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.output_format_var,
-            values=list(OUTPUT_FORMAT_LABELS.values()),
-            state="readonly",
-        )
-        self.output_format_combo.grid(row=3, column=5, sticky="ew", pady=(10, 0))
-
-        ttk.Label(settings_frame, text="接尾辞").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        self.suffix_entry = ttk.Entry(settings_frame, textvariable=self.suffix_var)
-        self.suffix_entry.grid(row=4, column=1, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(settings_frame, text="補間方式").grid(row=4, column=2, sticky="w", pady=(10, 0))
-        self.interpolation_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.interpolation_var,
-            values=list(INTERPOLATION_LABELS.values()),
-            state="readonly",
-        )
-        self.interpolation_combo.grid(row=4, column=3, sticky="ew", padx=(8, 12), pady=(10, 0))
-        ttk.Label(settings_frame, text="JPEG画質").grid(row=4, column=4, sticky="w", pady=(10, 0))
-        self.jpeg_quality_entry = ttk.Entry(settings_frame, textvariable=self.jpeg_quality_var)
-        self.jpeg_quality_entry.grid(row=4, column=5, sticky="ew", pady=(10, 0))
-
-        ttk.Label(settings_frame, text="WebP画質").grid(row=5, column=0, sticky="w", pady=(10, 0))
-        self.webp_quality_entry = ttk.Entry(settings_frame, textvariable=self.webp_quality_var)
-        self.webp_quality_entry.grid(row=5, column=1, sticky="ew", padx=(8, 12), pady=(10, 0))
-
-        option_row = ttk.Frame(settings_frame)
-        option_row.grid(row=5, column=2, columnspan=4, sticky="ew", pady=(10, 0))
-        for column in range(3):
-            option_row.columnconfigure(column, weight=1)
-        self.recursive_folder_drop_check = ttk.Checkbutton(
-            option_row,
-            text="フォルダドロップを再帰追加",
-            variable=self.recursive_folder_drop_var,
-        )
-        self.recursive_folder_drop_check.grid(row=0, column=0, sticky="w")
-        self.keep_structure_check = ttk.Checkbutton(
-            option_row,
-            text="フォルダ追加時に階層を保持",
-            variable=self.keep_structure_var,
-        )
-        self.keep_structure_check.grid(row=0, column=1, sticky="w")
-        self.overwrite_check = ttk.Checkbutton(option_row, text="既存出力を上書き", variable=self.overwrite_var)
-        self.overwrite_check.grid(row=0, column=2, sticky="w")
-        self.delete_source_check = ttk.Checkbutton(option_row, text="処理後に元画像を削除", variable=self.delete_source_var)
-        self.delete_source_check.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.save_config_button = ttk.Button(option_row, text="設定保存", command=self.save_current_config)
-        self.save_config_button.grid(row=1, column=2, sticky="e", pady=(6, 0))
-
-        content = ttk.Frame(root)
-        content.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
-        content.rowconfigure(0, weight=1)
-
-        list_frame = ttk.LabelFrame(content, text="処理対象リスト", padding=12)
-        list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(1, weight=1)
-
-        list_button_frame = ttk.Frame(list_frame)
-        list_button_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        for column in range(5):
-            list_button_frame.columnconfigure(column, weight=1)
-        self.add_files_button = ttk.Button(list_button_frame, text="ファイル追加", command=self.add_files_from_dialog)
-        self.add_files_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.add_folder_button = ttk.Button(list_button_frame, text="フォルダから追加", command=self.add_folder_from_dialog)
-        self.add_folder_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        self.remove_selected_button = ttk.Button(list_button_frame, text="選択行を削除", command=self.remove_selected_items)
-        self.remove_selected_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
-        self.clear_list_button = ttk.Button(list_button_frame, text="リストをクリア", command=self.clear_items)
-        self.clear_list_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
-        self.remove_missing_button = ttk.Button(list_button_frame, text="存在しないファイルを除外", command=self.remove_missing_items)
-        self.remove_missing_button.grid(row=0, column=4, sticky="ew")
-
-        columns = ("file_name", "original_size", "aspect_ratio", "status", "output_name")
-        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
-        self.tree.heading("file_name", text="ファイル名")
-        self.tree.heading("original_size", text="元サイズ")
-        self.tree.heading("aspect_ratio", text="現在アスペクト比")
-        self.tree.heading("status", text="状態")
-        self.tree.heading("output_name", text="出力予定名")
-        self.tree.column("file_name", width=280, anchor="w")
-        self.tree.column("original_size", width=110, anchor="center")
-        self.tree.column("aspect_ratio", width=110, anchor="center")
-        self.tree.column("status", width=100, anchor="center")
-        self.tree.column("output_name", width=320, anchor="w")
-        tree_scroll_y = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
-        tree_scroll_x = ttk.Scrollbar(list_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
-        self.tree.grid(row=1, column=0, sticky="nsew")
-        tree_scroll_y.grid(row=1, column=1, sticky="ns")
-        tree_scroll_x.grid(row=2, column=0, sticky="ew")
-        self.tree.bind("<<TreeviewSelect>>", self._on_tree_selection_changed)
-
-        right_panel = ttk.Frame(content)
-        right_panel.grid(row=0, column=1, sticky="nsew")
-        right_panel.columnconfigure(0, weight=1)
-        right_panel.rowconfigure(2, weight=1)
-
-        action_frame = ttk.LabelFrame(right_panel, text="操作", padding=12)
-        action_frame.grid(row=0, column=0, sticky="ew")
-        for column in range(5):
-            action_frame.columnconfigure(column, weight=1)
-        self.previous_button = ttk.Button(action_frame, text="前の画像", command=self.select_previous_item)
-        self.previous_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.next_button = ttk.Button(action_frame, text="次の画像", command=self.select_next_item)
-        self.next_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        self.refresh_preview_button = ttk.Button(action_frame, text="プレビュー更新", command=self.update_preview)
-        self.refresh_preview_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
-        self.start_button = ttk.Button(action_frame, text="処理開始", command=self.start_processing)
-        self.start_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
-        self.stop_button = ttk.Button(action_frame, text="停止要求", command=self.request_stop, state="disabled")
-        self.stop_button.grid(row=0, column=4, sticky="ew")
-
-        progress_frame = ttk.Frame(action_frame)
-        progress_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
-        progress_frame.columnconfigure(1, weight=1)
-        ttk.Label(progress_frame, text="状態").grid(row=0, column=0, sticky="w")
-        ttk.Label(progress_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(progress_frame, textvariable=self.progress_text_var).grid(row=0, column=2, sticky="e")
-        self.progress_bar = ttk.Progressbar(progress_frame, maximum=1.0, value=0.0)
-        self.progress_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-
-        info_frame = ttk.LabelFrame(right_panel, text="現在選択中画像の情報", padding=12)
-        info_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        for column in range(4):
-            info_frame.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
-        ttk.Label(info_frame, text="ファイル名").grid(row=0, column=0, sticky="w")
-        ttk.Label(info_frame, textvariable=self.selected_file_name_var).grid(row=0, column=1, sticky="w", padx=(8, 12))
-        ttk.Label(info_frame, text="元サイズ").grid(row=0, column=2, sticky="w")
-        ttk.Label(info_frame, textvariable=self.selected_size_var).grid(row=0, column=3, sticky="w", padx=(8, 0))
-        ttk.Label(info_frame, text="元アスペクト比").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(info_frame, textvariable=self.selected_aspect_var).grid(row=1, column=1, sticky="w", padx=(8, 12), pady=(8, 0))
-        ttk.Label(info_frame, text="補正後サイズ").grid(row=1, column=2, sticky="w", pady=(8, 0))
-        ttk.Label(info_frame, textvariable=self.corrected_size_var).grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(info_frame, text="補正後アスペクト比").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(info_frame, textvariable=self.corrected_aspect_var).grid(row=2, column=1, sticky="w", padx=(8, 12), pady=(8, 0))
-
-        preview_frame = ttk.Frame(right_panel)
-        preview_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
-        preview_frame.columnconfigure(0, weight=1)
-        preview_frame.columnconfigure(1, weight=1)
-        preview_frame.rowconfigure(0, weight=1)
-
-        before_frame = ttk.LabelFrame(preview_frame, text="補正前プレビュー", padding=8)
-        before_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        before_frame.columnconfigure(0, weight=1)
-        before_frame.rowconfigure(0, weight=1)
-        self.before_preview_label = ttk.Label(before_frame, text="画像を選択してください", anchor="center")
-        self.before_preview_label.grid(row=0, column=0, sticky="nsew")
-
-        after_frame = ttk.LabelFrame(preview_frame, text="補正後プレビュー", padding=8)
-        after_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-        after_frame.columnconfigure(0, weight=1)
-        after_frame.rowconfigure(0, weight=1)
-        self.after_preview_label = ttk.Label(after_frame, text="プレビュー未作成", anchor="center")
-        self.after_preview_label.grid(row=0, column=0, sticky="nsew")
-
-        log_frame = ttk.LabelFrame(root, text="ログ", padding=12)
-        log_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state="disabled", wrap="word", font=("Consolas", 10))
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-
-    def _load_config_into_vars(self, config: AppConfig) -> None:
-        self.output_folder_var.set(config.output_folder)
-        self.recursive_folder_drop_var.set(config.recursive_folder_drop)
-        self.keep_structure_var.set(config.keep_folder_structure_when_folder_added)
-        self.extensions_var.set(", ".join(config.extensions))
-        self.mode_var.set(MODE_LABELS.get(config.mode, MODE_LABELS["manual_scale"]))
-        self.x_scale_var.set(_format_number(config.x_scale))
-        self.y_scale_var.set(_format_number(config.y_scale))
-        self.target_aspect_ratio_var.set(config.target_aspect_ratio)
-        self.output_canvas_mode_var.set(CANVAS_MODE_LABELS.get(config.output_canvas_mode, CANVAS_MODE_LABELS["blur_background"]))
-        self.output_format_var.set(OUTPUT_FORMAT_LABELS.get(config.output_format, OUTPUT_FORMAT_LABELS["keep_original"]))
-        self.suffix_var.set(config.suffix)
-        self.jpeg_quality_var.set(str(config.jpeg_quality))
-        self.webp_quality_var.set(str(config.webp_quality))
-        self.interpolation_var.set(INTERPOLATION_LABELS.get(config.interpolation, INTERPOLATION_LABELS["lanczos"]))
-        self.overwrite_var.set(config.overwrite)
-        self.delete_source_var.set(config.delete_source)
-
-    def _bind_var_traces(self) -> None:
-        watched_vars: list[tk.Variable] = [
-            self.output_folder_var,
-            self.keep_structure_var,
-            self.output_format_var,
-            self.suffix_var,
-            self.overwrite_var,
-        ]
-        for variable in watched_vars:
-            variable.trace_add("write", lambda *_: self._schedule_output_refresh())
-
-    def _register_drop_targets(self) -> None:
-        if TkinterDnD is None or DND_FILES is None:
-            return
-        self.drop_label.drop_target_register(DND_FILES)
-        self.drop_label.dnd_bind("<<Drop>>", self._on_drop)
-
-    def _update_drop_note(self) -> None:
-        if TKDND_IMPORT_ERROR is None:
-            self.drop_note_label.configure(text="画像ファイルとフォルダのドロップに対応しています。")
-        else:
-            self.drop_note_label.configure(text=DROP_FALLBACK_MESSAGE)
-
-    def _schedule_output_refresh(self) -> None:
-        if self.processing_thread is not None:
-            return
-        if self._pending_output_refresh is not None:
-            try:
-                self.after_cancel(self._pending_output_refresh)
-            except Exception:
-                pass
-        self._pending_output_refresh = self.after(150, self._refresh_planned_outputs)
-
-    def _refresh_planned_outputs(self) -> None:
-        self._pending_output_refresh = None
-        if not self.items:
-            return
-        try:
-            config = self._build_config_from_vars(strict=False)
-            assign_output_paths(self.items, config)
-            self._refresh_all_tree_rows()
-            self._update_selected_info()
-        except Exception:
-            for item in self.items:
-                item.output_name = "-"
-                item.output_path = None
-            self._refresh_all_tree_rows()
-
-    def select_output_folder(self) -> None:
-        selected = filedialog.askdirectory(title="出力フォルダを選択", initialdir=self.output_folder_var.get().strip() or None)
-        if selected:
-            self.output_folder_var.set(selected)
-
-    def add_files_from_dialog(self) -> None:
-        if self.processing_thread is not None:
-            return
-        paths = filedialog.askopenfilenames(
-            title="画像ファイルを追加",
-            filetypes=self._build_dialog_filetypes(),
-        )
-        if not paths:
-            return
-        self._add_paths([Path(path) for path in paths], source_root=None, added_via_folder=False)
-
-    def add_folder_from_dialog(self) -> None:
-        if self.processing_thread is not None:
-            return
-        selected = filedialog.askdirectory(title="画像フォルダを追加")
-        if not selected:
-            return
-        folder = Path(selected)
-        self._add_folder_contents(folder)
-
-    def _on_drop(self, event: Any) -> None:
-        if self.processing_thread is not None:
-            return
-        paths = self._parse_drop_data(str(getattr(event, "data", "")))
-        if not paths:
-            return
-        self._add_mixed_drop_paths(paths)
-
-    def _parse_drop_data(self, raw: str) -> list[Path]:
-        if not raw:
-            return []
-        try:
-            parsed = self.tk.splitlist(raw)
-        except Exception:
-            parsed = [raw]
-        results: list[Path] = []
-        for item in parsed:
-            text = str(item).strip()
-            if not text:
-                continue
-            results.append(Path(text))
-        return results
-
-    def _add_mixed_drop_paths(self, paths: list[Path]) -> None:
-        file_paths: list[Path] = []
-        for path in paths:
-            if path.is_dir():
-                self._add_folder_contents(path)
-            else:
-                file_paths.append(path)
-        if file_paths:
-            self._add_paths(file_paths, source_root=None, added_via_folder=False)
-
-    def _add_folder_contents(self, folder: Path) -> None:
-        if not folder.exists():
-            self._append_log_line(f"存在しないフォルダのため追加しませんでした: {folder}")
-            return
-        try:
-            config = self._build_config_from_vars(strict=False)
-        except Exception:
-            config = self.config_data
-        image_files = collect_image_files(folder, normalize_extensions(config.extensions), config.recursive_folder_drop)
-        if not image_files:
-            self._append_log_line(f"フォルダ内に対象画像がありませんでした: {folder}")
-            return
-        self._add_paths(image_files, source_root=folder, added_via_folder=True)
-
-    def _add_paths(self, paths: list[Path], source_root: Path | None, added_via_folder: bool) -> None:
-        if PIL_IMPORT_ERROR is not None or Image is None or ImageOps is None:
-            messagebox.showerror(APP_TITLE, f"Pillow の読み込みに失敗しているため画像を追加できません。{PIL_IMPORT_ERROR}")
-            return
-
-        added_count = 0
-        skipped_count = 0
-        for raw_path in paths:
-            path = Path(raw_path)
-            if not path.exists() or not path.is_file():
-                skipped_count += 1
-                continue
-            if not is_supported_extension(path.suffix, normalize_extensions(self.extensions_var.get().split(","))):
-                skipped_count += 1
-                continue
-            source_key = normalize_path_key(path)
-            if source_key in self.source_key_set:
-                skipped_count += 1
-                continue
-            try:
-                image_size = read_oriented_image_size(path)
-            except (UnidentifiedImageError, OSError) as exc:
-                skipped_count += 1
-                self._append_log_line(f"画像を読み込めなかったため追加しませんでした: {path.name} ({exc})")
-                continue
-
-            self.item_counter += 1
-            item = ProcessItem(
-                item_id=str(self.item_counter),
-                source_path=path,
-                source_root=source_root,
-                added_via_folder=added_via_folder,
-                original_size=image_size,
-                original_aspect_text=format_ratio_text(*image_size),
-            )
-            self.items.append(item)
-            self.item_lookup[item.item_id] = item
-            self.source_key_set.add(source_key)
-            self.tree.insert("", "end", iid=item.item_id, values=self._build_tree_values(item))
-            added_count += 1
-
-        if added_count:
-            self._schedule_output_refresh()
-            self._append_log_line(f"画像を {added_count} 件追加しました。")
-            if not self.tree.selection():
-                self.tree.selection_set(self.items[0].item_id)
-                self.tree.focus(self.items[0].item_id)
-                self._update_selected_info()
-                self.update_preview()
-        if skipped_count:
-            self._append_log_line(f"追加対象外の項目を {skipped_count} 件スキップしました。")
-
-    def remove_selected_items(self) -> None:
-        if self.processing_thread is not None:
-            return
-        selected_ids = list(self.tree.selection())
-        if not selected_ids:
-            return
-        removed_count = 0
-        for item_id in selected_ids:
-            item = self.item_lookup.pop(item_id, None)
-            if item is None:
-                continue
-            self.source_key_set.discard(normalize_path_key(item.source_path))
-            self.items = [existing for existing in self.items if existing.item_id != item_id]
-            self.tree.delete(item_id)
-            removed_count += 1
-        if removed_count:
-            self._append_log_line(f"選択行を {removed_count} 件削除しました。")
-            self._schedule_output_refresh()
-            self._select_first_item_if_needed()
-
-    def clear_items(self) -> None:
-        if self.processing_thread is not None:
-            return
-        if not self.items:
-            return
-        self.items.clear()
-        self.item_lookup.clear()
-        self.source_key_set.clear()
-        self.tree.delete(*self.tree.get_children())
-        self._clear_preview()
-        self._update_selected_info()
-        self._append_log_line("処理対象リストをクリアしました。")
-
-    def remove_missing_items(self) -> None:
-        if self.processing_thread is not None:
-            return
-        missing_ids = [item.item_id for item in self.items if not item.source_path.exists()]
-        if not missing_ids:
-            self._append_log_line("存在しないファイルはありませんでした。")
-            return
-        for item_id in missing_ids:
-            item = self.item_lookup.pop(item_id, None)
-            if item is not None:
-                self.source_key_set.discard(normalize_path_key(item.source_path))
-        self.items = [item for item in self.items if item.item_id not in set(missing_ids)]
-        for item_id in missing_ids:
-            if self.tree.exists(item_id):
-                self.tree.delete(item_id)
-        self._append_log_line(f"存在しないファイルを {len(missing_ids)} 件除外しました。")
-        self._schedule_output_refresh()
-        self._select_first_item_if_needed()
-
-    def select_previous_item(self) -> None:
-        self._select_relative_item(-1)
-
-    def select_next_item(self) -> None:
-        self._select_relative_item(1)
-
-    def _select_relative_item(self, delta: int) -> None:
-        if not self.items:
-            return
-        selected_item = self.get_selected_item()
-        if selected_item is None:
-            target = self.items[0]
-        else:
-            current_index = next((index for index, item in enumerate(self.items) if item.item_id == selected_item.item_id), 0)
-            target = self.items[max(0, min(len(self.items) - 1, current_index + delta))]
-        self.tree.selection_set(target.item_id)
-        self.tree.focus(target.item_id)
-        self.tree.see(target.item_id)
-        self._update_selected_info()
-        self.update_preview()
-
-    def _select_first_item_if_needed(self) -> None:
-        if self.tree.selection():
-            self._update_selected_info()
-            return
-        if not self.items:
-            self._clear_preview()
-            self._update_selected_info()
-            return
-        first = self.items[0]
-        self.tree.selection_set(first.item_id)
-        self.tree.focus(first.item_id)
-        self.tree.see(first.item_id)
-        self._update_selected_info()
-        self.update_preview()
-
-    def get_selected_item(self) -> ProcessItem | None:
-        selected_ids = self.tree.selection()
-        if not selected_ids:
-            return None
-        return self.item_lookup.get(selected_ids[0])
-
-    def _on_tree_selection_changed(self, _event: Any) -> None:
-        self._update_selected_info()
-        self.update_preview()
-
-    def _update_selected_info(self) -> None:
-        item = self.get_selected_item()
-        if item is None:
-            self.selected_file_name_var.set("-")
-            self.selected_size_var.set("-")
-            self.selected_aspect_var.set("-")
-            self.corrected_size_var.set("-")
-            self.corrected_aspect_var.set("-")
-            return
-
-        self.selected_file_name_var.set(item.source_path.name)
-        self.selected_size_var.set(format_size(item.original_size))
-        self.selected_aspect_var.set(item.original_aspect_text)
-
-        try:
-            config = self._build_config_from_vars(strict=False)
-            output_size = calculate_output_size(item.original_size, config)
-            self.corrected_size_var.set(format_size(output_size))
-            self.corrected_aspect_var.set(format_ratio_text(*output_size))
-        except Exception:
-            self.corrected_size_var.set("-")
-            self.corrected_aspect_var.set("-")
-
-    def update_preview(self) -> None:
-        item = self.get_selected_item()
-        if item is None:
-            self._clear_preview()
-            return
-        try:
-            config = self._build_config_from_vars(strict=False)
-            before_image, after_image, output_size = render_preview_images(item.source_path, config)
-            self.preview_before_photo = make_photo_image(before_image, PREVIEW_BOX_SIZE)
-            self.preview_after_photo = make_photo_image(after_image, PREVIEW_BOX_SIZE)
-            self.before_preview_label.configure(image=self.preview_before_photo, text="")
-            self.after_preview_label.configure(image=self.preview_after_photo, text="")
-            self.corrected_size_var.set(format_size(output_size))
-            self.corrected_aspect_var.set(format_ratio_text(*output_size))
-        except Exception as exc:
-            self._clear_preview()
-            self.corrected_size_var.set("-")
-            self.corrected_aspect_var.set("-")
-            self._append_log_line(f"プレビュー更新に失敗しました: {item.source_path.name} ({exc})")
-
-    def _clear_preview(self) -> None:
-        self.preview_before_photo = None
-        self.preview_after_photo = None
-        self.before_preview_label.configure(image="", text="画像を選択してください")
-        self.after_preview_label.configure(image="", text="プレビュー未作成")
-
-    def request_stop(self) -> None:
-        if self.processing_thread is None:
-            return
-        self.stop_event.set()
-        self.status_var.set("停止要求を受け付けました")
-        if self.current_logger is not None:
-            self.current_logger.warning("停止要求を受け付けました。現在の画像処理完了後に停止します。")
-
-    def save_current_config(self) -> None:
-        try:
-            config = self._build_config_from_vars(strict=False)
-            config.window_geometry = self.geometry()
-            save_config(config)
-            self.config_data = config
-            self._append_log_line(f"設定を保存しました: {CONFIG_PATH.name}")
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"設定保存に失敗しました。{exc}")
-
-    def start_processing(self) -> None:
-        if self.processing_thread is not None:
-            return
-        if not self.items:
-            messagebox.showwarning(APP_TITLE, "処理対象リストに画像がありません。")
-            return
-        try:
-            config = self._build_config_from_vars(strict=True)
-            config.window_geometry = self.geometry()
-            assign_output_paths(self.items, config)
-            save_config(config)
-            self.config_data = config
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, str(exc))
-            return
-
-        output_dir = Path(config.output_folder)
+class ZipBatchProcessor:
+    def __init__(
+        self,
+        config: AppConfig,
+        stop_event: threading.Event,
+        ui_sender: callable,
+        logger: RunLogger,
+    ) -> None:
+        self.config = config
+        self.stop_event = stop_event
+        self.ui_sender = ui_sender
+        self.logger = logger
+        self.frontal_cascade: Any | None = None
+        self.profile_cascade: Any | None = None
+
+    def run(self) -> BatchRunSummary:
+        self._ensure_dependencies()
+        self._load_cascades()
+        input_dir = Path(self.config.input_zip_folder)
+        output_dir = Path(self.config.output_folder)
+        temp_root = Path(self.config.temp_folder)
+        done_dir = Path(self.config.done_folder)
         output_dir.mkdir(parents=True, exist_ok=True)
-        started_at = datetime.now()
-        log_path = output_dir / LOG_FOLDER_NAME / f"aspectfix_{started_at.strftime('%Y%m%d_%H%M%S')}.log"
-        report_path = output_dir / f"{REPORT_FILE_PREFIX}{started_at.strftime('%Y%m%d_%H%M%S')}.txt"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        if self.config.move_done_zip:
+            done_dir.mkdir(parents=True, exist_ok=True)
 
-        self.stop_event.clear()
-        self.current_summary = BatchSummary(
-            started_at=started_at,
-            total_count=len(self.items),
-            log_file_path=log_path,
-            report_file_path=report_path,
+        zip_files = sorted((path for path in input_dir.glob("*.zip") if path.is_file()), key=lambda path: path.name.lower())
+        summary = BatchRunSummary(
+            started_at=datetime.now(),
+            total_zip_count=len(zip_files),
+            log_file_path=self.logger.log_path,
         )
-        self.current_logger = RunLogger(log_path, self._send_ui_message)
+        self.ui_sender(
+            {
+                "kind": "progress",
+                "value": 0.0,
+                "maximum": max(1.0, float(len(zip_files))),
+                "text": f"ZIP完了 0 / {len(zip_files)} 件 | 全体 0.0%",
+                "phase": "開始待ち",
+                "detail": "最初のZIPを待機しています",
+            }
+        )
 
-        self.status_var.set("処理を開始します")
-        self.progress_text_var.set(f"0 / {len(self.items)} 件")
-        self.progress_bar.configure(maximum=max(1, len(self.items)), value=0)
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.save_config_button.configure(state="disabled")
-
-        for item in self.items:
-            item.status = STATUS_WAITING
-            item.error_text = ""
-            item.output_size = None
-            item.output_aspect_text = "-"
-            item.processed_at = None
-        self._refresh_all_tree_rows()
-
-        self.processing_thread = threading.Thread(target=self._run_batch, args=(config,), daemon=True)
-        self.processing_thread.start()
-
-    def _run_batch(self, config: AppConfig) -> None:
-        assert self.current_summary is not None
-        assert self.current_logger is not None
-
-        summary = self.current_summary
-        logger = self.current_logger
-        items_snapshot = list(self.items)
-
-        try:
-            logger.info(f"追加された画像数: {len(items_snapshot)}")
-            logger.info(f"処理開始時刻: {summary.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info(
-                f"使用設定: 横倍率={config.x_scale:.4f}, 縦倍率={config.y_scale:.4f}, 目標アスペクト比={config.target_aspect_ratio}, "
-                f"出力方式={canvas_mode_name(config.output_canvas_mode)}, 出力形式={output_format_name(config.output_format)}"
-            )
-
-            for index, item in enumerate(items_snapshot, start=1):
-                if self.stop_event.is_set():
-                    summary.stopped = True
-                    self._send_ui_message({"kind": "item_status", "item_id": item.item_id, "status": STATUS_STOPPED})
-                    break
-
-                if not item.source_path.exists():
-                    summary.skip_count += 1
-                    logger.warning(f"{item.source_path.name}: 元ファイルが存在しないためスキップしました。")
-                    self._send_ui_message(
-                        {
-                            "kind": "item_result",
-                            "item_id": item.item_id,
-                            "status": STATUS_SKIPPED,
-                            "error_text": "元ファイルが存在しません。",
-                        }
-                    )
-                    self._send_ui_message({"kind": "progress", "current": index, "total": len(items_snapshot)})
-                    continue
-
-                self._send_ui_message({"kind": "item_status", "item_id": item.item_id, "status": STATUS_PROCESSING})
-                try:
-                    output_path = item.output_path
-                    if output_path is None:
-                        raise RuntimeError("出力予定パスを決定できませんでした。")
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    if config.overwrite and output_path.exists():
-                        output_path.unlink()
-
-                    result_image, metadata = render_output_image(item.source_path, config)
-                    save_output_image(result_image, output_path, item.source_path, config)
-
-                    if config.delete_source:
-                        item.source_path.unlink()
-
-                    summary.success_count += 1
-                    logger.info(
-                        f"{item.source_path.name}: 完了 / 元サイズ={format_size(metadata['source_size'])} / "
-                        f"出力サイズ={format_size(metadata['output_size'])} / 横倍率={config.x_scale:.4f} / "
-                        f"縦倍率={config.y_scale:.4f} / 出力方式={canvas_mode_name(config.output_canvas_mode)} / "
-                        f"保存先={output_path.name}"
-                    )
-                    self._send_ui_message(
-                        {
-                            "kind": "item_result",
-                            "item_id": item.item_id,
-                            "status": STATUS_DONE,
-                            "output_size": metadata["output_size"],
-                            "output_aspect_text": format_ratio_text(*metadata["output_size"]),
-                            "error_text": "",
-                        }
-                    )
-                except Exception as exc:
-                    summary.failure_count += 1
-                    logger.error(
-                        f"{item.source_path.name}: 失敗 / 元サイズ={format_size(item.original_size)} / "
-                        f"横倍率={config.x_scale:.4f} / 縦倍率={config.y_scale:.4f} / 出力方式={canvas_mode_name(config.output_canvas_mode)} / "
-                        f"エラー={exc}"
-                    )
-                    self._send_ui_message(
-                        {
-                            "kind": "item_result",
-                            "item_id": item.item_id,
-                            "status": STATUS_FAILED,
-                            "error_text": str(exc),
-                        }
-                    )
-                self._send_ui_message({"kind": "progress", "current": index, "total": len(items_snapshot)})
-
+        if not zip_files:
+            self.logger.warning("入力フォルダに ZIP がありません。処理を終了します。")
             summary.finished_at = datetime.now()
-            write_report(summary.report_file_path, summary, items_snapshot, config)
-            logger.info(f"成功数: {summary.success_count}")
-            logger.info(f"失敗数: {summary.failure_count}")
-            logger.info(f"スキップ数: {summary.skip_count}")
-            logger.info(f"レポート: {summary.report_file_path}")
-            self._send_ui_message({"kind": "finish", "summary": summary})
-        except Exception as exc:
-            summary.finished_at = datetime.now()
-            self._send_ui_message(
+            return summary
+
+        for zip_index, zip_path in enumerate(zip_files):
+            if self.stop_event.is_set():
+                summary.stopped = True
+                self.logger.info("停止要求により次のZIP開始前で停止します。")
+                break
+
+            self.ui_sender({"kind": "current_zip", "name": zip_path.name})
+            self._emit_phase_progress(zip_index, len(zip_files), "extract", 0.0, "処理を開始します")
+            result = self._process_single_zip(zip_path, zip_index, len(zip_files))
+            summary.processed_zip_count += 1
+            if result.skipped:
+                summary.skipped_zip_count += 1
+            elif result.success:
+                summary.success_zip_count += 1
+            else:
+                summary.failed_zip_count += 1
+            self.ui_sender(
                 {
-                    "kind": "finish",
-                    "summary": summary,
-                    "fatal_error": f"{exc}{WINDOWS_NEWLINE}{traceback.format_exc()}",
+                    "kind": "progress",
+                    "value": float(zip_index + 1),
+                    "maximum": max(1.0, float(len(zip_files))),
+                    "text": self._format_progress_text(zip_index + 1.0, len(zip_files)),
+                    "phase": "ZIP完了",
+                    "detail": zip_path.name,
                 }
             )
 
-    def _send_ui_message(self, message: dict[str, Any]) -> None:
-        self.ui_queue.put(message)
+        summary.finished_at = datetime.now()
+        return summary
 
-    def _drain_ui_queue(self) -> None:
-        while True:
-            try:
-                message = self.ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_ui_message(message)
-        self.after(100, self._drain_ui_queue)
+    def _ensure_dependencies(self) -> None:
+        if PIL_IMPORT_ERROR is not None:
+            raise RuntimeError(f"Pillow の読み込みに失敗しました: {PIL_IMPORT_ERROR}")
+        if NUMPY_IMPORT_ERROR is not None:
+            raise RuntimeError(f"numpy の読み込みに失敗しました: {NUMPY_IMPORT_ERROR}")
+        if CV2_IMPORT_ERROR is not None:
+            raise RuntimeError(f"OpenCV の読み込みに失敗しました: {CV2_IMPORT_ERROR}")
+        if Image is None or np is None or cv2 is None:
+            raise RuntimeError("Pillow / numpy / OpenCV の初期化に失敗しました。")
 
-    def _handle_ui_message(self, message: dict[str, Any]) -> None:
-        kind = str(message.get("kind", ""))
-        if kind == "log":
-            self._append_log_line(str(message.get("line", "")))
-            return
-        if kind == "item_status":
-            item = self.item_lookup.get(str(message.get("item_id", "")))
-            if item is None:
-                return
-            item.status = str(message.get("status", item.status))
-            self._refresh_tree_row(item)
-            return
-        if kind == "item_result":
-            item = self.item_lookup.get(str(message.get("item_id", "")))
-            if item is None:
-                return
-            item.status = str(message.get("status", item.status))
-            item.error_text = str(message.get("error_text", ""))
-            output_size = message.get("output_size")
-            if isinstance(output_size, tuple):
-                item.output_size = output_size
-            output_aspect_text = str(message.get("output_aspect_text", ""))
-            if output_aspect_text:
-                item.output_aspect_text = output_aspect_text
-            item.processed_at = datetime.now()
-            self._refresh_tree_row(item)
-            if self.get_selected_item() is item:
-                self._update_selected_info()
-            return
-        if kind == "progress":
-            current = int(message.get("current", 0))
-            total = max(1, int(message.get("total", 1)))
-            self.progress_bar.configure(maximum=total, value=min(current, total))
-            self.progress_text_var.set(f"{min(current, total)} / {total} 件")
-            self.status_var.set(f"処理中 {min(current, total)} / {total} 件")
-            return
-        if kind == "finish":
-            summary = message.get("summary")
-            fatal_error = message.get("fatal_error")
-            self.processing_thread = None
-            self.stop_button.configure(state="disabled")
-            self.start_button.configure(state="normal")
-            self.save_config_button.configure(state="normal")
-            if isinstance(summary, BatchSummary):
-                total = max(1, summary.total_count)
-                processed = summary.success_count + summary.failure_count + summary.skip_count
-                self.progress_bar.configure(maximum=total, value=min(processed, total))
-                self.progress_text_var.set(f"{min(processed, total)} / {summary.total_count} 件")
-                if fatal_error:
-                    self.status_var.set("致命的エラー")
-                    messagebox.showerror(APP_TITLE, f"処理が致命的エラーで終了しました。{fatal_error}")
-                elif summary.stopped:
-                    self.status_var.set("停止完了")
-                    messagebox.showinfo(
-                        APP_TITLE,
-                        WINDOWS_NEWLINE.join(
-                            [
-                                "停止要求により処理を終了しました。",
-                                f"成功: {summary.success_count}",
-                                f"失敗: {summary.failure_count}",
-                                f"スキップ: {summary.skip_count}",
-                                f"ログ: {summary.log_file_path}",
-                                f"レポート: {summary.report_file_path}",
-                            ]
-                        ),
-                    )
+    def _load_cascades(self) -> None:
+        assert cv2 is not None
+        frontal_path = ensure_local_cascade_copy(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
+        profile_path = ensure_local_cascade_copy(Path(cv2.data.haarcascades) / "haarcascade_profileface.xml")
+
+        self.frontal_cascade = cv2.CascadeClassifier(str(frontal_path))
+        if self.frontal_cascade.empty():
+            raise RuntimeError(f"顔検出カスケードの読み込みに失敗しました: {frontal_path}")
+
+        if profile_path.exists():
+            profile = cv2.CascadeClassifier(str(profile_path))
+            self.profile_cascade = None if profile.empty() else profile
+        else:
+            self.profile_cascade = None
+
+    def _process_single_zip(self, zip_path: Path, zip_index: int, total_zip_count: int) -> ZipProcessResult:
+        output_dir = Path(self.config.output_folder)
+        temp_root = Path(self.config.temp_folder)
+        result_dir = output_dir / sanitize_path_part(zip_path.stem)
+
+        if result_dir.exists():
+            if not self.config.overwrite_output:
+                self.logger.warning(f"{zip_path.name}: 出力先 {result_dir.name} が既にあるためスキップしました。")
+                self._emit_phase_progress(zip_index, total_zip_count, "cleanup", 1.0, "既存出力があるためスキップ")
+                return ZipProcessResult(
+                    zip_path=zip_path,
+                    zip_name=zip_path.name,
+                    result_dir=result_dir,
+                    temp_dir=temp_root,
+                    started_at=datetime.now(),
+                    finished_at=datetime.now(),
+                    skipped=True,
+                    errors=["既存出力があるためスキップしました。"],
+                )
+            shutil.rmtree(result_dir, ignore_errors=True)
+
+        result_dir.mkdir(parents=True, exist_ok=True)
+        for category in CATEGORY_ORDER:
+            (result_dir / category_name(category)).mkdir(parents=True, exist_ok=True)
+
+        temp_dir = Path(tempfile.mkdtemp(prefix=f"{sanitize_path_part(zip_path.stem)}_", dir=str(temp_root)))
+        result = ZipProcessResult(
+            zip_path=zip_path,
+            zip_name=zip_path.name,
+            result_dir=result_dir,
+            temp_dir=temp_dir,
+            started_at=datetime.now(),
+        )
+
+        self.logger.info(f"{zip_path.name}: 処理を開始しました。")
+        try:
+            self._emit_phase_progress(zip_index, total_zip_count, "extract", 0.2, "ZIP を一時フォルダへ展開しています")
+            self._extract_zip(zip_path, temp_dir)
+            self._emit_phase_progress(zip_index, total_zip_count, "extract", 1.0, "ZIP 展開が完了しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "scan", 0.2, "画像ファイルを列挙しています")
+            image_files = sorted(
+                (
+                    path
+                    for path in temp_dir.rglob("*")
+                    if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+                ),
+                key=lambda path: str(path.relative_to(temp_dir)).lower(),
+            )
+            result.total_images = len(image_files)
+            self.logger.info(f"{zip_path.name}: 画像 {len(image_files)} 枚を検出しました。")
+            self._emit_phase_progress(zip_index, total_zip_count, "scan", 1.0, f"画像 {len(image_files)} 枚を検出")
+
+            for image_index, image_path in enumerate(image_files, start=1):
+                record = self._classify_image(temp_dir, image_path)
+                self._copy_record_if_needed(result_dir, record, result.errors)
+                result.records.append(record)
+                if record.category == CATEGORY_SELECTED:
+                    result.selected_count += 1
+                elif record.category == CATEGORY_REVIEW:
+                    result.review_count += 1
                 else:
-                    self.status_var.set("処理完了")
-                    messagebox.showinfo(
-                        APP_TITLE,
-                        WINDOWS_NEWLINE.join(
-                            [
-                                "処理が完了しました。",
-                                f"成功: {summary.success_count}",
-                                f"失敗: {summary.failure_count}",
-                                f"スキップ: {summary.skip_count}",
-                                f"ログ: {summary.log_file_path}",
-                                f"レポート: {summary.report_file_path}",
-                            ]
-                        ),
+                    result.exclude_count += 1
+
+                if should_emit_progress_update(image_index, len(image_files)):
+                    self._emit_phase_progress(
+                        zip_index,
+                        total_zip_count,
+                        "classify",
+                        image_index / max(1, len(image_files)),
+                        f"{image_index} / {max(1, len(image_files))} 画像",
                     )
+
+            selected_records = [record for record in result.records if record.category == CATEGORY_SELECTED]
+            review_records = [record for record in result.records if record.category == CATEGORY_REVIEW]
+
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 0.0, "一覧（全画像）を作成しています")
+            self._create_contact_sheet_safe(
+                zip_name=zip_path.name,
+                result_errors=result.errors,
+                output_path=result_dir / CONTACT_SHEET_ALL,
+                records=result.records,
+                title="一覧（全画像）",
+                progress_callback=lambda current, total: self._emit_contact_sheet_progress(
+                    zip_index,
+                    total_zip_count,
+                    "contact_all",
+                    current,
+                    total,
+                    "全画像",
+                ),
+            )
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_all", 1.0, "一覧（全画像）を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 0.0, "一覧（候補）を作成しています")
+            self._create_contact_sheet_safe(
+                zip_name=zip_path.name,
+                result_errors=result.errors,
+                output_path=result_dir / CONTACT_SHEET_SELECTED,
+                records=selected_records,
+                title="一覧（候補）",
+                progress_callback=lambda current, total: self._emit_contact_sheet_progress(
+                    zip_index,
+                    total_zip_count,
+                    "contact_selected",
+                    current,
+                    total,
+                    "候補",
+                ),
+            )
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_selected", 1.0, "一覧（候補）を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 0.0, "一覧（目検）を作成しています")
+            self._create_contact_sheet_safe(
+                zip_name=zip_path.name,
+                result_errors=result.errors,
+                output_path=result_dir / CONTACT_SHEET_REVIEW,
+                records=review_records,
+                title="一覧（目検）",
+                progress_callback=lambda current, total: self._emit_contact_sheet_progress(
+                    zip_index,
+                    total_zip_count,
+                    "contact_review",
+                    current,
+                    total,
+                    "目検",
+                ),
+            )
+            self._emit_phase_progress(zip_index, total_zip_count, "contact_review", 1.0, "一覧（目検）を作成しました")
+            result.success = True
+
+            if self.config.move_done_zip:
+                try:
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 0.2, "成功した ZIP を処理済み保存先へ移動しています")
+                    moved_path = self._move_to_done(zip_path)
+                    self.logger.info(f"{zip_path.name}: 処理成功のため処理済み保存先へ移動しました。{moved_path.name}")
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, f"処理済み保存先へ移動しました: {moved_path.name}")
+                except Exception as exc:
+                    error_message = f"{zip_path.name}: 処理済み保存先への移動に失敗しました。入力フォルダに残します。{exc}"
+                    result.errors.append(error_message)
+                    self.logger.error(error_message)
+                    self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "処理済み保存先への移動に失敗しました")
+            else:
+                self.logger.info(f"{zip_path.name}: 処理済み保存先への移動は無効設定のため実行していません。")
+                self._emit_phase_progress(zip_index, total_zip_count, "done_move", 1.0, "処理済み保存先への移動は行いません")
+            self._emit_phase_progress(zip_index, total_zip_count, "report", 0.2, f"{REPORT_FILE_NAME} を作成しています")
+            self._write_selection_report(result)
+            self._emit_phase_progress(zip_index, total_zip_count, "report", 1.0, f"{REPORT_FILE_NAME} を作成しました")
+            self._emit_phase_progress(zip_index, total_zip_count, "archive", 0.0, "結果フォルダを ZIP 化しています")
+            archive_path = self._create_result_zip(
+                result_dir,
+                zip_path.stem,
+                progress_callback=lambda current, total: self._emit_archive_progress(
+                    zip_index,
+                    total_zip_count,
+                    current,
+                    total,
+                ),
+            )
+            self.logger.info(f"{zip_path.name}: 結果ZIPを作成しました。{archive_path.name}")
+            self._emit_phase_progress(zip_index, total_zip_count, "archive", 1.0, f"結果ZIP作成完了: {archive_path.name}")
+        except zipfile.BadZipFile as exc:
+            error_message = f"{zip_path.name}: ZIP の展開に失敗しました。破損ZIPの可能性があります。{exc}"
+            result.errors.append(error_message)
+            self.logger.error(error_message)
+            self._write_selection_report(result)
+        except Exception as exc:  # pragma: no cover - defensive path
+            error_message = f"{zip_path.name}: ZIP 処理中に例外が発生しました。{exc}"
+            result.errors.append(error_message)
+            result.errors.append(traceback.format_exc())
+            self.logger.error(error_message)
+            self.logger.error(traceback.format_exc().rstrip())
+            self._write_selection_report(result)
+        finally:
+            self._emit_phase_progress(zip_index, total_zip_count, "cleanup", 0.2, "一時フォルダを整理しています")
+            if self.config.delete_temp_folder:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            result.finished_at = datetime.now()
+            self._emit_phase_progress(zip_index, total_zip_count, "cleanup", 1.0, "現在の ZIP を終了しました")
+            if not result.success:
+                self.logger.warning(f"{zip_path.name}: 処理は失敗扱いで完了しました。次のZIPへ進みます。")
+            else:
+                self.logger.info(
+                    f"{zip_path.name}: 処理完了。候補={result.selected_count}, 目検={result.review_count}, 除外={result.exclude_count}"
+                )
+        return result
+
+    def _emit_phase_progress(
+        self,
+        zip_index: int,
+        total_zip_count: int,
+        phase_key: str,
+        phase_ratio: float,
+        detail: str,
+    ) -> None:
+        phase_start, phase_weight, phase_label = ZIP_PROGRESS_PHASES[phase_key]
+        normalized_ratio = max(0.0, min(1.0, phase_ratio))
+        zip_progress = phase_start + (phase_weight * normalized_ratio)
+        overall_value = float(zip_index) + zip_progress
+        self.ui_sender(
+            {
+                "kind": "progress",
+                "value": overall_value,
+                "maximum": max(1.0, float(total_zip_count)),
+                "text": self._format_progress_text(overall_value, total_zip_count),
+                "phase": phase_label,
+                "detail": detail,
+            }
+        )
+
+    def _emit_contact_sheet_progress(
+        self,
+        zip_index: int,
+        total_zip_count: int,
+        phase_key: str,
+        current: int,
+        total: int,
+        label: str,
+    ) -> None:
+        if should_emit_progress_update(current, total):
+            self._emit_phase_progress(
+                zip_index,
+                total_zip_count,
+                phase_key,
+                current / max(1, total),
+                f"{label} {current} / {max(1, total)} 枚",
+            )
+
+    def _emit_archive_progress(self, zip_index: int, total_zip_count: int, current: int, total: int) -> None:
+        if should_emit_progress_update(current, total):
+            self._emit_phase_progress(
+                zip_index,
+                total_zip_count,
+                "archive",
+                current / max(1, total),
+                f"{current} / {max(1, total)} ファイル",
+            )
+
+    def _format_progress_text(self, value: float, total_zip_count: int) -> str:
+        maximum = max(1.0, float(total_zip_count))
+        percent = min(100.0, max(0.0, (value / maximum) * 100.0))
+        completed_zip_count = min(total_zip_count, max(0, int(value)))
+        return f"ZIP完了 {completed_zip_count} / {total_zip_count} 件 | 全体 {percent:.1f}%"
+
+    def _extract_zip(self, zip_path: Path, destination_dir: Path) -> None:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as archive:
+            for info in archive.infolist():
+                relative_path = normalize_zip_member_path(info)
+                if relative_path is None:
+                    continue
+                target_path = destination_dir / relative_path
+                if info.is_dir():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    continue
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as source, target_path.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+
+    def _classify_image(self, temp_root: Path, image_path: Path) -> ImageRecord:
+        relative_path = str(image_path.relative_to(temp_root))
+        try:
+            image_rgb = load_rgb_image(image_path)
+        except (OSError, ValueError, UnidentifiedImageError) as exc:
+            return ImageRecord(
+                relative_path=relative_path,
+                category=CATEGORY_EXCLUDE,
+                reason_codes=["broken_image"],
+                face_count=0,
+                face_ratio=0.0,
+                blur_value=0.0,
+                face_mode="none",
+                brightness=0.0,
+                source_path=image_path,
+            )
+
+        gray = cv2.cvtColor(np.array(image_rgb), cv2.COLOR_RGB2GRAY)
+        blur_value = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(gray.mean())
+        frontal_faces, profile_faces = self._detect_faces(gray)
+
+        if frontal_faces:
+            primary_faces = frontal_faces
+            face_mode = "frontal"
+        elif profile_faces:
+            primary_faces = profile_faces
+            face_mode = "profile"
+        else:
+            primary_faces = []
+            face_mode = "none"
+
+        face_count = len(primary_faces)
+        face_ratio = 0.0
+        face_near_edge = False
+        if primary_faces:
+            largest_face = max(primary_faces, key=lambda rect: rect[2] * rect[3])
+            face_ratio = (largest_face[2] * largest_face[3]) / float(gray.shape[0] * gray.shape[1])
+            face_near_edge = is_face_near_edge(largest_face, gray.shape[1], gray.shape[0])
+
+        if face_count == 0:
+            category = CATEGORY_EXCLUDE
+            reason_codes = ["no_face"]
+        elif face_count > 1:
+            category = CATEGORY_EXCLUDE
+            reason_codes = ["multiple_faces"]
+        elif face_mode == "profile":
+            if face_ratio < self.config.review_min_face_ratio:
+                category = CATEGORY_EXCLUDE
+                reason_codes = ["profile_face_too_small"]
+            elif blur_value < self.config.blur_threshold * 0.65:
+                category = CATEGORY_EXCLUDE
+                reason_codes = ["profile_face_blurry"]
+            else:
+                category = CATEGORY_REVIEW
+                reason_codes = ["profile_or_angle_face"]
+        else:
+            if face_ratio < self.config.review_min_face_ratio:
+                category = CATEGORY_EXCLUDE
+                reason_codes = ["face_too_small"]
+            elif blur_value < self.config.blur_threshold * 0.55:
+                category = CATEGORY_EXCLUDE
+                reason_codes = ["strong_blur"]
+            else:
+                weak_reasons: list[str] = []
+                if face_ratio < self.config.selected_min_face_ratio:
+                    weak_reasons.append("face_small_for_selected")
+                if blur_value < self.config.blur_threshold:
+                    weak_reasons.append("slight_blur")
+                if face_near_edge:
+                    weak_reasons.append("face_near_edge")
+                if brightness < 50.0 or brightness > 225.0:
+                    weak_reasons.append("brightness_extreme")
+
+                if weak_reasons:
+                    category = CATEGORY_REVIEW
+                    reason_codes = weak_reasons
+                else:
+                    category = CATEGORY_SELECTED
+                    reason_codes = ["frontal_face_clear"]
+
+        return ImageRecord(
+            relative_path=relative_path,
+            category=category,
+            reason_codes=reason_codes,
+            face_count=face_count,
+            face_ratio=face_ratio,
+            blur_value=blur_value,
+            face_mode=face_mode,
+            brightness=brightness,
+            source_path=image_path,
+        )
+
+    def _detect_faces(self, gray: Any) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+        assert cv2 is not None
+        assert self.frontal_cascade is not None
+        equalized = cv2.equalizeHist(gray)
+        min_face_size = max(24, min(gray.shape[0], gray.shape[1]) // 20)
+        frontal_raw = self.frontal_cascade.detectMultiScale(
+            equalized,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(min_face_size, min_face_size),
+        )
+        frontal_faces = dedupe_rectangles(rectangles_to_list(frontal_raw))
+
+        profile_faces: list[tuple[int, int, int, int]] = []
+        if self.profile_cascade is not None:
+            profile_raw = self.profile_cascade.detectMultiScale(
+                equalized,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(min_face_size, min_face_size),
+            )
+            profile_faces.extend(rectangles_to_list(profile_raw))
+
+            flipped = cv2.flip(equalized, 1)
+            profile_flipped_raw = self.profile_cascade.detectMultiScale(
+                flipped,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(min_face_size, min_face_size),
+            )
+            for x, y, w, h in rectangles_to_list(profile_flipped_raw):
+                converted_x = gray.shape[1] - x - w
+                profile_faces.append((converted_x, y, w, h))
+            profile_faces = dedupe_rectangles(profile_faces)
+
+        return frontal_faces, profile_faces
+
+    def _copy_record_if_needed(self, result_dir: Path, record: ImageRecord, error_messages: list[str]) -> None:
+        if record.category == CATEGORY_EXCLUDE and not self.config.copy_exclude_images:
             return
 
-    def _append_log_line(self, line: str) -> None:
-        if not line:
-            return
+        category_dir = result_dir / category_name(record.category)
+        relative_path = Path(record.relative_path)
+        destination_path = category_dir / relative_path
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(record.source_path, destination_path)
+            record.copied_path = destination_path
+        except Exception as exc:
+            record.reason_codes.append("copy_failed")
+            error_message = f"{record.relative_path}: {category_name(record.category)} フォルダへのコピーに失敗しました。{exc}"
+            error_messages.append(error_message)
+            self.logger.error(error_message)
+
+    def _create_contact_sheet(
+        self,
+        output_path: Path,
+        records: list[ImageRecord],
+        title: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[Path]:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            return []
+
+        columns = max(1, self.config.contact_sheet_columns)
+        thumb_width = max(120, self.config.thumbnail_width)
+        thumb_height = max(100, int(thumb_width * 0.75))
+        text_height = 64
+        padding = 16
+        header_height = 54
+        tile_width = thumb_width + padding * 2
+        tile_height = thumb_height + text_height + padding * 2
+
+        title_font = load_contact_font(20)
+        body_font = load_contact_font(14)
+        effective_columns = min(columns, max(1, CONTACT_SHEET_MAX_PAGE_WIDTH // max(1, tile_width)))
+        if effective_columns < columns:
+            self.logger.warning(
+                f"{output_path.name}: 幅が大きすぎるため、一覧画像列数を {columns} から {effective_columns} に調整しました。"
+            )
+
+        if not records:
+            canvas = Image.new("RGB", (tile_width, header_height + tile_height), color=(245, 245, 245))
+            draw = ImageDraw.Draw(canvas)
+            draw.text((padding, 14), title, fill=(32, 32, 32), font=title_font)
+            draw.text((padding, header_height + 20), "対象画像はありません。", fill=(80, 80, 80), font=body_font)
+            save_contact_sheet(canvas, output_path)
+            if progress_callback is not None:
+                progress_callback(1, 1)
+            return [output_path]
+
+        max_rows_by_height = max(1, (CONTACT_SHEET_MAX_PAGE_HEIGHT - header_height) // max(1, tile_height))
+        page_canvas_width = effective_columns * tile_width
+        max_rows_by_pixels = max(1, CONTACT_SHEET_MAX_PAGE_PIXELS // max(1, page_canvas_width * tile_height))
+        rows_per_page = max(1, min(max_rows_by_height, max_rows_by_pixels))
+        records_per_page = max(1, effective_columns * rows_per_page)
+        page_count = (len(records) + records_per_page - 1) // records_per_page
+        if page_count > 1:
+            self.logger.warning(
+                f"{output_path.name}: 画像 {len(records)} 枚のため、一覧画像を {page_count} 分割で出力します。"
+            )
+
+        output_paths: list[Path] = []
+        for page_index in range(page_count):
+            page_records = records[page_index * records_per_page : (page_index + 1) * records_per_page]
+            page_rows = (len(page_records) + effective_columns - 1) // effective_columns
+            canvas_width = effective_columns * tile_width
+            canvas_height = header_height + page_rows * tile_height
+            canvas = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
+            draw = ImageDraw.Draw(canvas)
+            page_title = title if page_count == 1 else f"{title} ({page_index + 1}/{page_count})"
+            draw.text((padding, 14), page_title, fill=(32, 32, 32), font=title_font)
+
+            for record_index, record in enumerate(page_records):
+                row = record_index // effective_columns
+                column = record_index % effective_columns
+                tile_left = column * tile_width
+                tile_top = header_height + row * tile_height
+                image_left = tile_left + padding
+                image_top = tile_top + padding
+                tile_box = (tile_left + 6, tile_top + 6, tile_left + tile_width - 6, tile_top + tile_height - 6)
+                draw.rounded_rectangle(tile_box, radius=8, outline=CATEGORY_BORDER_COLORS.get(record.category, (130, 130, 130)), width=3, fill=(255, 255, 255))
+
+                thumbnail = make_thumbnail_image(record.source_path, thumb_width, thumb_height)
+                canvas.paste(thumbnail, (image_left, image_top))
+
+                caption_path = trim_middle(Path(record.relative_path).name, 28)
+                caption_reason = trim_middle(record.short_reason_text, 28)
+                caption_text = f"{caption_path}\n{caption_reason}"
+                wrapped_lines: list[str] = []
+                for caption_line in caption_text.splitlines():
+                    wrapped_lines.extend(textwrap.wrap(caption_line, width=max(8, thumb_width // 11)) or [""])
+                draw.multiline_text(
+                    (image_left, image_top + thumb_height + 8),
+                    "\n".join(wrapped_lines[:4]),
+                    fill=(40, 40, 40),
+                    font=body_font,
+                    spacing=2,
+                )
+                if progress_callback is not None:
+                    progress_callback((page_index * records_per_page) + record_index + 1, len(records))
+
+            page_output_path = output_path if page_index == 0 else output_path.with_name(
+                CONTACT_SHEET_PART_TEMPLATE.format(
+                    stem=output_path.stem,
+                    page=page_index + 1,
+                    suffix=output_path.suffix,
+                )
+            )
+            save_contact_sheet(canvas, page_output_path)
+            output_paths.append(page_output_path)
+        return output_paths
+
+    def _create_contact_sheet_safe(
+        self,
+        zip_name: str,
+        result_errors: list[str],
+        output_path: Path,
+        records: list[ImageRecord],
+        title: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
+        try:
+            self._create_contact_sheet(output_path, records, title, progress_callback=progress_callback)
+        except Exception as exc:
+            error_message = f"{zip_name}: {output_path.name} の作成に失敗しました。{exc}"
+            result_errors.append(error_message)
+            self.logger.error(error_message)
+            try:
+                write_contact_sheet_error_notice(output_path, title, str(exc))
+            except Exception as notice_exc:
+                self.logger.error(f"{zip_name}: 一覧画像エラー通知の作成にも失敗しました。{notice_exc}")
+
+    def _write_selection_report(self, result: ZipProcessResult) -> None:
+        report_path = result.result_dir / REPORT_FILE_NAME
+        started = result.started_at.strftime("%Y-%m-%d %H:%M:%S")
+        finished = (result.finished_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+        config_lines = [
+            f"入力ZIPフォルダ: {self.config.input_zip_folder}",
+            f"出力フォルダ: {self.config.output_folder}",
+            f"一時フォルダ: {self.config.temp_folder}",
+            f"処理済みZIP保存先: {self.config.done_folder}",
+            f"候補用 最小顔比率: {self.config.selected_min_face_ratio:.4f}",
+            f"目検用 最小顔比率: {self.config.review_min_face_ratio:.4f}",
+            f"ブレ閾値: {self.config.blur_threshold:.2f}",
+            f"一覧画像列数: {self.config.contact_sheet_columns}",
+            f"サムネイル幅: {self.config.thumbnail_width}",
+            f"処理済みZIPを移動: {bool_to_japanese(self.config.move_done_zip)}",
+            f"一時フォルダを削除: {bool_to_japanese(self.config.delete_temp_folder)}",
+            f"既存出力を上書き: {bool_to_japanese(self.config.overwrite_output)}",
+            f"除外画像もコピー: {bool_to_japanese(self.config.copy_exclude_images)}",
+        ]
+
+        lines = [
+            "人物画像ZIP前処理レポート",
+            "注意: 候補は採用確定ではありません。目検も人間確認対象です。本人判定は自動確定しません。",
+            "",
+            f"元ZIP名: {result.zip_name}",
+            f"開始時刻: {started}",
+            f"終了時刻: {finished}",
+            f"処理成功: {'はい' if result.success else 'いいえ'}",
+            f"総画像数: {result.total_images}",
+            f"候補数: {result.selected_count}",
+            f"目検数: {result.review_count}",
+            f"除外数: {result.exclude_count}",
+            "",
+            "使用設定:",
+            *config_lines,
+            "",
+            "エラー内容:",
+        ]
+
+        if result.errors:
+            for error in result.errors:
+                lines.append(f"- {error}")
+        else:
+            lines.append("- なし")
+
+        lines.extend(
+            [
+                "",
+                "各画像の判定結果:",
+            ]
+        )
+
+        if result.records:
+            for record in result.records:
+                lines.append(
+                    f"{record.relative_path} : {category_name(record.category)} / "
+                    f"{record.reason_text} / "
+                    f"{face_count_label(record.face_count)} / "
+                    f"顔検出={face_mode_name(record.face_mode)} / "
+                    f"顔比率={record.face_ratio:.4f} / "
+                    f"ブレ値={record.blur_value:.2f} / "
+                    f"明るさ={record.brightness:.2f}"
+                )
+        else:
+            lines.append("画像が見つからなかったため、画像別の判定結果はありません。")
+
+        with report_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(WINDOWS_NEWLINE.join(lines) + WINDOWS_NEWLINE)
+
+    def _create_result_zip(
+        self,
+        result_dir: Path,
+        original_stem: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> Path:
+        archive_path = result_dir / f"{sanitize_path_part(original_stem)}{RESULT_ZIP_SUFFIX}"
+        if archive_path.exists():
+            archive_path.unlink()
+
+        file_paths = [path for path in sorted(result_dir.rglob("*"), key=lambda item: str(item).lower()) if path != archive_path and path.is_file()]
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for index, path in enumerate(file_paths, start=1):
+                archive.write(path, arcname=str(path.relative_to(result_dir)))
+                if progress_callback is not None:
+                    progress_callback(index, len(file_paths))
+        return archive_path
+
+    def _move_to_done(self, zip_path: Path) -> Path:
+        destination_dir = Path(self.config.done_folder)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = destination_dir / zip_path.name
+        if destination_path.exists():
+            if self.config.overwrite_output:
+                destination_path.unlink()
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                destination_path = destination_dir / f"{zip_path.stem}_{timestamp}{zip_path.suffix}"
+        last_error: Exception | None = None
+        for _attempt in range(5):
+            try:
+                shutil.move(str(zip_path), str(destination_path))
+                return destination_path
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.4)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("処理済み保存先への移動に失敗しました。")
+
+
+class ZipPreprocessorApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(APP_TITLE)
+        self.minsize(1040, 780)
+
+        self.ui_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_thread: threading.Thread | None = None
+        self.current_log_path: Path | None = None
+
+        self.input_zip_folder_var = tk.StringVar()
+        self.output_folder_var = tk.StringVar()
+        self.temp_folder_var = tk.StringVar()
+        self.done_folder_var = tk.StringVar()
+        self.selected_min_face_ratio_var = tk.StringVar()
+        self.review_min_face_ratio_var = tk.StringVar()
+        self.blur_threshold_var = tk.StringVar()
+        self.contact_sheet_columns_var = tk.StringVar()
+        self.thumbnail_width_var = tk.StringVar()
+        self.move_done_zip_var = tk.BooleanVar(value=True)
+        self.delete_temp_folder_var = tk.BooleanVar(value=True)
+        self.overwrite_output_var = tk.BooleanVar(value=False)
+        self.copy_exclude_images_var = tk.BooleanVar(value=False)
+        self.current_zip_var = tk.StringVar(value="待機中")
+        self.phase_var = tk.StringVar(value="待機中")
+        self.progress_text_var = tk.StringVar(value="ZIP完了 0 / 0 件 | 全体 0.0%")
+        self.status_var = tk.StringVar(value="待機中")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_max_var = tk.DoubleVar(value=1.0)
+
+        self._build_ui()
+        self._load_config_into_ui(silent=True)
+        self._report_dependency_status()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(120, self._process_ui_queue)
+
+    def _build_ui(self) -> None:
+        root_frame = ttk.Frame(self, padding=12)
+        root_frame.pack(fill="both", expand=True)
+        root_frame.columnconfigure(0, weight=1)
+        root_frame.rowconfigure(2, weight=1)
+
+        path_group = ttk.LabelFrame(root_frame, text="フォルダ設定", padding=12)
+        path_group.grid(row=0, column=0, sticky="ew")
+        path_group.columnconfigure(1, weight=1)
+
+        self._add_path_row(path_group, 0, "入力ZIPフォルダ", self.input_zip_folder_var)
+        self._add_path_row(path_group, 1, "出力フォルダ", self.output_folder_var)
+        self._add_path_row(path_group, 2, "一時フォルダ", self.temp_folder_var)
+        self._add_path_row(path_group, 3, "処理済みZIP保存先", self.done_folder_var)
+
+        settings_group = ttk.LabelFrame(root_frame, text="判定設定", padding=12)
+        settings_group.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        for column in range(4):
+            settings_group.columnconfigure(column, weight=1 if column % 2 == 1 else 0)
+
+        self._add_entry_row(settings_group, 0, 0, "候補用 最小顔比率", self.selected_min_face_ratio_var)
+        self._add_entry_row(settings_group, 0, 2, "目検用 最小顔比率", self.review_min_face_ratio_var)
+        self._add_entry_row(settings_group, 1, 0, "ブレ閾値", self.blur_threshold_var)
+        self._add_entry_row(settings_group, 1, 2, "一覧画像列数", self.contact_sheet_columns_var)
+        self._add_entry_row(settings_group, 2, 0, "サムネイル幅", self.thumbnail_width_var)
+
+        check_frame = ttk.Frame(settings_group)
+        check_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        check_frame.columnconfigure(0, weight=1)
+        check_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(check_frame, text="処理済みZIPを保存先へ移動", variable=self.move_done_zip_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(check_frame, text="一時フォルダを処理後削除", variable=self.delete_temp_folder_var).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(check_frame, text="既存出力を上書き", variable=self.overwrite_output_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(check_frame, text="除外画像もコピーする", variable=self.copy_exclude_images_var).grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        action_group = ttk.LabelFrame(root_frame, text="実行", padding=12)
+        action_group.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        action_group.columnconfigure(0, weight=1)
+        action_group.rowconfigure(4, weight=1)
+
+        button_frame = ttk.Frame(action_group)
+        button_frame.grid(row=0, column=0, sticky="ew")
+        for index in range(4):
+            button_frame.columnconfigure(index, weight=1)
+
+        self.start_button = ttk.Button(button_frame, text="処理開始", command=self.start_processing)
+        self.start_button.grid(row=0, column=0, sticky="ew")
+        self.stop_button = ttk.Button(button_frame, text="停止要求", command=self.request_stop, state="disabled")
+        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.save_button = ttk.Button(button_frame, text="設定保存", command=self.save_config)
+        self.save_button.grid(row=0, column=2, sticky="ew", padx=(8, 0))
+        self.load_button = ttk.Button(button_frame, text="設定読込", command=self.load_config)
+        self.load_button.grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        status_frame = ttk.Frame(action_group)
+        status_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        status_frame.columnconfigure(1, weight=1)
+        ttk.Label(status_frame, text="現在処理中").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.current_zip_var).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(status_frame, text="状態").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.status_var).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
+        ttk.Label(status_frame, text="工程").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(status_frame, textvariable=self.phase_var).grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(6, 0))
+
+        progress_frame = ttk.Frame(action_group)
+        progress_frame.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=1.0)
+        self.progress_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(progress_frame, textvariable=self.progress_text_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        ttk.Label(action_group, text="ログ").grid(row=3, column=0, sticky="w", pady=(12, 4))
+        self.log_text = scrolledtext.ScrolledText(action_group, height=22, wrap="word")
+        self.log_text.grid(row=4, column=0, sticky="nsew")
+        self.log_text.configure(state="disabled")
+
+    def _add_path_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=(10, 10), pady=4)
+        ttk.Button(parent, text="選択...", command=lambda var=variable: self._choose_directory(var)).grid(row=row, column=2, sticky="ew", pady=4)
+
+    def _add_entry_row(self, parent: ttk.Frame, row: int, column: int, label: str, variable: tk.StringVar) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=column, sticky="w", pady=4)
+        ttk.Entry(parent, textvariable=variable, width=20).grid(row=row, column=column + 1, sticky="ew", padx=(10, 18), pady=4)
+
+    def _choose_directory(self, variable: tk.StringVar) -> None:
+        initial_dir = variable.get().strip() or str(BASE_DIR)
+        selected = filedialog.askdirectory(title="フォルダ選択", initialdir=initial_dir)
+        if selected:
+            variable.set(selected)
+
+    def _report_dependency_status(self) -> None:
+        if PIL_IMPORT_ERROR is not None:
+            self.append_log(f"Pillow の読み込みに失敗しています: {PIL_IMPORT_ERROR}")
+        if NUMPY_IMPORT_ERROR is not None:
+            self.append_log(f"numpy の読み込みに失敗しています: {NUMPY_IMPORT_ERROR}")
+        if CV2_IMPORT_ERROR is not None:
+            self.append_log(f"OpenCV の読み込みに失敗しています: {CV2_IMPORT_ERROR}")
+
+    def append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", line + WINDOWS_NEWLINE)
+        self.log_text.insert("end", message + WINDOWS_NEWLINE)
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _build_tree_values(self, item: ProcessItem) -> tuple[str, str, str, str, str]:
-        return (
-            item.source_path.name,
-            format_size(item.original_size),
-            item.original_aspect_text,
-            item.status,
-            item.output_name,
-        )
-
-    def _refresh_tree_row(self, item: ProcessItem) -> None:
-        if self.tree.exists(item.item_id):
-            self.tree.item(item.item_id, values=self._build_tree_values(item))
-
-    def _refresh_all_tree_rows(self) -> None:
-        for item in self.items:
-            self._refresh_tree_row(item)
-
-    def _build_dialog_filetypes(self) -> list[tuple[str, str]]:
-        extensions = normalize_extensions(self.extensions_var.get().split(","))
-        patterns = [f"*{extension}" for extension in extensions]
-        if patterns:
-            return [("画像ファイル", " ".join(patterns)), ("すべてのファイル", "*.*")]
-        return [("すべてのファイル", "*.*")]
-
-    def _build_config_from_vars(self, strict: bool) -> AppConfig:
-        output_folder = self.output_folder_var.get().strip()
-        extensions = normalize_extensions(self.extensions_var.get().split(","))
-        mode = MODE_LABEL_TO_KEY.get(self.mode_var.get().strip(), "manual_scale")
-        output_canvas_mode = CANVAS_MODE_LABEL_TO_KEY.get(self.output_canvas_mode_var.get().strip(), "blur_background")
-        output_format = OUTPUT_FORMAT_LABEL_TO_KEY.get(self.output_format_var.get().strip(), "keep_original")
-        interpolation = INTERPOLATION_LABEL_TO_KEY.get(self.interpolation_var.get().strip(), "lanczos")
-        suffix = self.suffix_var.get().strip()
-        target_aspect_ratio = self.target_aspect_ratio_var.get().strip()
-        x_scale = _safe_float(self.x_scale_var.get(), 0.95)
-        y_scale = _safe_float(self.y_scale_var.get(), 1.0)
-        jpeg_quality = _safe_int(self.jpeg_quality_var.get(), 95)
-        webp_quality = _safe_int(self.webp_quality_var.get(), 95)
-
-        if strict:
-            if PIL_IMPORT_ERROR is not None or Image is None or ImageOps is None:
-                raise ValueError(f"Pillow の読み込みに失敗しています。{PIL_IMPORT_ERROR}")
-            if not output_folder:
-                raise ValueError("出力フォルダを指定してください。")
-            if not suffix:
-                raise ValueError("接尾辞を指定してください。")
-            if any(character in INVALID_FILE_NAME_CHARS for character in suffix):
-                raise ValueError("接尾辞に Windows で使えない文字が含まれています。")
-            if x_scale <= 0:
-                raise ValueError("横倍率は 0 より大きい値にしてください。")
-            if y_scale <= 0:
-                raise ValueError("縦倍率は 0 より大きい値にしてください。")
-            if not extensions:
-                raise ValueError("対象拡張子を 1 つ以上指定してください。")
-            if not target_aspect_ratio:
-                raise ValueError("目標アスペクト比を指定してください。")
-            parse_aspect_ratio(target_aspect_ratio)
-            if not (1 <= jpeg_quality <= 100):
-                raise ValueError("JPEG画質は 1 から 100 の範囲で指定してください。")
-            if not (1 <= webp_quality <= 100):
-                raise ValueError("WebP画質は 1 から 100 の範囲で指定してください。")
-        else:
-            if not output_folder:
-                output_folder = self.config_data.output_folder
-            if not suffix:
-                suffix = "_aspectfix"
-            if x_scale <= 0:
-                x_scale = 0.95
-            if y_scale <= 0:
-                y_scale = 1.0
-            if not extensions:
-                extensions = list(DEFAULT_EXTENSIONS)
-            if not target_aspect_ratio:
-                target_aspect_ratio = "16:9"
-            jpeg_quality = _clamp_int(jpeg_quality, 1, 100)
-            webp_quality = _clamp_int(webp_quality, 1, 100)
-
-        return AppConfig(
-            output_folder=output_folder,
-            recursive_folder_drop=self.recursive_folder_drop_var.get(),
-            keep_folder_structure_when_folder_added=self.keep_structure_var.get(),
-            extensions=extensions,
-            mode=mode,
-            x_scale=x_scale,
-            y_scale=y_scale,
-            target_aspect_ratio=target_aspect_ratio,
-            output_canvas_mode=output_canvas_mode,
-            output_format=output_format,
-            suffix=suffix,
-            jpeg_quality=jpeg_quality,
-            webp_quality=webp_quality,
-            interpolation=interpolation,
-            overwrite=self.overwrite_var.get(),
-            delete_source=self.delete_source_var.get(),
-            window_geometry=self.geometry(),
-        )
-
-    def on_close(self) -> None:
-        if self.processing_thread is not None:
-            if not messagebox.askyesno(APP_TITLE, "処理中です。停止要求を出して終了しますか。"):
-                return
-            self.stop_event.set()
+    def save_config(self, silent: bool = False) -> bool:
         try:
-            config = self._build_config_from_vars(strict=False)
-            config.window_geometry = self.geometry()
-            save_config(config)
-        except Exception:
+            config = self._build_config_from_ui()
+        except ValueError as exc:
+            if not silent:
+                messagebox.showerror(APP_TITLE, str(exc))
+            return False
+
+        try:
+            CONFIG_PATH.write_text(json.dumps(config.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            if not silent:
+                self.append_log(f"設定を保存しました: {CONFIG_PATH}")
+                messagebox.showinfo(APP_TITLE, f"設定を保存しました。{CONFIG_PATH.name}")
+            return True
+        except OSError as exc:
+            if not silent:
+                messagebox.showerror(APP_TITLE, f"config.json の保存に失敗しました。{exc}")
+            return False
+
+    def load_config(self) -> None:
+        self._load_config_into_ui(silent=False)
+
+    def _load_config_into_ui(self, silent: bool) -> bool:
+        if not CONFIG_PATH.exists():
+            if not silent:
+                messagebox.showwarning(APP_TITLE, "config.json が見つかりません。")
+            defaults = AppConfig()
+            self._apply_config_to_ui(defaults)
+            return False
+
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            config = AppConfig.from_dict(raw)
+            self._apply_config_to_ui(config)
+            geometry = config.window_geometry.strip()
+            if geometry:
+                self.geometry(geometry)
+            if not silent:
+                self.append_log(f"設定を読込しました: {CONFIG_PATH}")
+                messagebox.showinfo(APP_TITLE, f"設定を読込しました。{CONFIG_PATH.name}")
+            return True
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror(APP_TITLE, f"config.json の読込に失敗しました。{exc}")
+            return False
+
+    def _apply_config_to_ui(self, config: AppConfig) -> None:
+        self.input_zip_folder_var.set(config.input_zip_folder)
+        self.output_folder_var.set(config.output_folder)
+        self.temp_folder_var.set(config.temp_folder)
+        self.done_folder_var.set(config.done_folder)
+        self.selected_min_face_ratio_var.set(f"{config.selected_min_face_ratio:.4f}")
+        self.review_min_face_ratio_var.set(f"{config.review_min_face_ratio:.4f}")
+        self.blur_threshold_var.set(f"{config.blur_threshold:.2f}")
+        self.contact_sheet_columns_var.set(str(config.contact_sheet_columns))
+        self.thumbnail_width_var.set(str(config.thumbnail_width))
+        self.move_done_zip_var.set(config.move_done_zip)
+        self.delete_temp_folder_var.set(config.delete_temp_folder)
+        self.overwrite_output_var.set(config.overwrite_output)
+        self.copy_exclude_images_var.set(config.copy_exclude_images)
+
+    def _build_config_from_ui(self) -> AppConfig:
+        input_zip_folder = self.input_zip_folder_var.get().strip()
+        output_folder = self.output_folder_var.get().strip()
+        temp_folder = self.temp_folder_var.get().strip()
+        done_folder = self.done_folder_var.get().strip()
+
+        if not input_zip_folder:
+            raise ValueError("入力ZIPフォルダを指定してください。")
+        if not output_folder:
+            raise ValueError("出力フォルダを指定してください。")
+        if not temp_folder:
+            raise ValueError("一時フォルダを指定してください。")
+        if self.move_done_zip_var.get() and not done_folder:
+            raise ValueError("処理済みZIP保存先フォルダを指定してください。")
+
+        input_path = Path(input_zip_folder)
+        output_path = Path(output_folder)
+        temp_path = Path(temp_folder)
+        done_path = Path(done_folder) if done_folder else None
+
+        if not input_path.exists() or not input_path.is_dir():
+            raise ValueError("入力ZIPフォルダが存在しません。")
+        if same_path(input_path, output_path):
+            raise ValueError("入力ZIPフォルダと出力フォルダを同じパスにはできません。")
+        if same_path(input_path, temp_path):
+            raise ValueError("入力ZIPフォルダと一時フォルダは別にしてください。")
+        if done_path is not None and same_path(input_path, done_path):
+            raise ValueError("入力ZIPフォルダと処理済みZIP保存先フォルダは別にしてください。")
+
+        selected_min_face_ratio = _safe_float(self.selected_min_face_ratio_var.get(), -1.0)
+        review_min_face_ratio = _safe_float(self.review_min_face_ratio_var.get(), -1.0)
+        blur_threshold = _safe_float(self.blur_threshold_var.get(), -1.0)
+        contact_sheet_columns = _safe_int(self.contact_sheet_columns_var.get(), -1)
+        thumbnail_width = _safe_int(self.thumbnail_width_var.get(), -1)
+
+        if not (0.0 < selected_min_face_ratio <= 1.0):
+            raise ValueError("候補用 最小顔比率は 0 より大きく 1 以下で指定してください。")
+        if not (0.0 < review_min_face_ratio <= 1.0):
+            raise ValueError("目検用 最小顔比率は 0 より大きく 1 以下で指定してください。")
+        if selected_min_face_ratio < review_min_face_ratio:
+            raise ValueError("候補用 最小顔比率は 目検用 以上にしてください。")
+        if blur_threshold <= 0.0:
+            raise ValueError("ブレ閾値は 0 より大きい値にしてください。")
+        if contact_sheet_columns <= 0:
+            raise ValueError("一覧画像列数は 1 以上にしてください。")
+        if thumbnail_width < 120:
+            raise ValueError("サムネイル幅は 120 以上にしてください。")
+
+        geometry = self.geometry()
+        return AppConfig(
+            input_zip_folder=str(input_path),
+            output_folder=str(output_path),
+            temp_folder=str(temp_path),
+            done_folder=str(done_path) if done_path is not None else "",
+            selected_min_face_ratio=selected_min_face_ratio,
+            review_min_face_ratio=review_min_face_ratio,
+            blur_threshold=blur_threshold,
+            contact_sheet_columns=contact_sheet_columns,
+            thumbnail_width=thumbnail_width,
+            move_done_zip=self.move_done_zip_var.get(),
+            delete_temp_folder=self.delete_temp_folder_var.get(),
+            overwrite_output=self.overwrite_output_var.get(),
+            copy_exclude_images=self.copy_exclude_images_var.get(),
+            window_geometry=geometry,
+        )
+
+    def start_processing(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning(APP_TITLE, "既に処理中です。")
+            return
+        try:
+            config = self._build_config_from_ui()
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
+
+        if PIL_IMPORT_ERROR is not None or NUMPY_IMPORT_ERROR is not None or CV2_IMPORT_ERROR is not None:
+            dependency_errors = []
+            if PIL_IMPORT_ERROR is not None:
+                dependency_errors.append(f"Pillow: {PIL_IMPORT_ERROR}")
+            if NUMPY_IMPORT_ERROR is not None:
+                dependency_errors.append(f"numpy: {NUMPY_IMPORT_ERROR}")
+            if CV2_IMPORT_ERROR is not None:
+                dependency_errors.append(f"OpenCV: {CV2_IMPORT_ERROR}")
+            messagebox.showerror(APP_TITLE, "依存関係が不足しています。" + WINDOWS_NEWLINE + WINDOWS_NEWLINE.join(dependency_errors))
+            return
+
+        self.save_config(silent=True)
+        Path(config.output_folder).mkdir(parents=True, exist_ok=True)
+        log_dir = Path(config.output_folder) / LOG_FOLDER_NAME
+        log_name = f"処理ログ_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.current_log_path = log_dir / log_name
+
+        self.stop_event.clear()
+        self.current_zip_var.set("開始準備中")
+        self.status_var.set("処理中")
+        self.phase_var.set("開始準備中")
+        self.progress_var.set(0.0)
+        self.progress_bar.configure(maximum=1.0)
+        self.progress_text_var.set("ZIP完了 0 / 0 件 | 全体 0.0%")
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.save_button.configure(state="disabled")
+        self.load_button.configure(state="disabled")
+        self.append_log(f"処理を開始します。ログ: {self.current_log_path}")
+
+        self.worker_thread = threading.Thread(target=self._run_processing_worker, args=(config,), daemon=True)
+        self.worker_thread.start()
+
+    def request_stop(self) -> None:
+        if not self.worker_thread or not self.worker_thread.is_alive():
+            return
+        self.stop_event.set()
+        self.status_var.set("停止要求済み")
+        self.append_log(STOP_MESSAGE)
+        self.stop_button.configure(state="disabled")
+
+    def _run_processing_worker(self, config: AppConfig) -> None:
+        assert self.current_log_path is not None
+        logger = RunLogger(self.current_log_path, self._send_ui_message)
+        logger.info("バッチ処理を開始しました。")
+        summary: BatchRunSummary | None = None
+        try:
+            processor = ZipBatchProcessor(config=config, stop_event=self.stop_event, ui_sender=self._send_ui_message, logger=logger)
+            summary = processor.run()
+            logger.info(
+                f"全体完了: 処理ZIP数={summary.processed_zip_count}, 成功={summary.success_zip_count}, 失敗={summary.failed_zip_count}, スキップ={summary.skipped_zip_count}, 停止={bool_to_japanese(summary.stopped)}"
+            )
+            self._send_ui_message({"kind": "finish", "summary": summary})
+        except Exception as exc:
+            logger.error(f"全体処理で致命的な例外が発生しました。{exc}")
+            logger.error(traceback.format_exc().rstrip())
+            failed_summary = summary or BatchRunSummary(
+                started_at=datetime.now(),
+                finished_at=datetime.now(),
+                total_zip_count=0,
+                log_file_path=self.current_log_path,
+            )
+            self._send_ui_message({"kind": "finish", "summary": failed_summary, "fatal_error": str(exc)})
+
+    def _send_ui_message(self, payload: dict[str, Any]) -> None:
+        self.ui_queue.put(payload)
+
+    def _process_ui_queue(self) -> None:
+        try:
+            while True:
+                payload = self.ui_queue.get_nowait()
+                kind = payload.get("kind")
+                if kind == "log":
+                    self.append_log(str(payload.get("line", "")))
+                elif kind == "progress":
+                    maximum = float(payload.get("maximum", 1.0))
+                    value = float(payload.get("value", 0.0))
+                    self.progress_bar.configure(maximum=max(1.0, maximum))
+                    self.progress_var.set(value)
+                    self.progress_text_var.set(str(payload.get("text", "")))
+                    phase = str(payload.get("phase", "")).strip()
+                    detail = str(payload.get("detail", "")).strip()
+                    if phase:
+                        self.phase_var.set(f"{phase} | {detail}" if detail else phase)
+                elif kind == "current_zip":
+                    self.current_zip_var.set(str(payload.get("name", "")))
+                elif kind == "finish":
+                    self._handle_finish(payload)
+        except queue.Empty:
             pass
+        finally:
+            self.after(120, self._process_ui_queue)
+
+    def _handle_finish(self, payload: dict[str, Any]) -> None:
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.save_button.configure(state="normal")
+        self.load_button.configure(state="normal")
+
+        summary = payload.get("summary")
+        fatal_error = payload.get("fatal_error")
+        if isinstance(summary, BatchRunSummary):
+            if fatal_error:
+                self.status_var.set("異常終了")
+            elif summary.stopped:
+                self.status_var.set("停止完了")
+            else:
+                self.status_var.set("処理完了")
+
+            if fatal_error:
+                messagebox.showerror(APP_TITLE, f"処理が致命的エラーで終了しました。{fatal_error}")
+            else:
+                message_lines = [
+                    f"処理ZIP数: {summary.processed_zip_count} / {summary.total_zip_count}",
+                    f"成功: {summary.success_zip_count}",
+                    f"失敗: {summary.failed_zip_count}",
+                    f"スキップ: {summary.skipped_zip_count}",
+                ]
+                if summary.stopped:
+                    message_lines.append("停止要求により次のZIP開始前で停止しました。")
+                if summary.log_file_path is not None:
+                    message_lines.append(f"ログ: {summary.log_file_path}")
+                messagebox.showinfo(APP_TITLE, WINDOWS_NEWLINE.join(message_lines))
+        else:
+            self.status_var.set("処理完了")
+
+        self.current_zip_var.set("待機中")
+        self.phase_var.set("待機中")
+
+    def _on_close(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning(APP_TITLE, "処理中です。停止要求で処理完了を待ってから閉じてください。")
+            return
+        self.save_config(silent=True)
         self.destroy()
 
 
-def ensure_pillow_available() -> None:
-    if PIL_IMPORT_ERROR is not None or Image is None or ImageFilter is None or ImageOps is None:
-        raise RuntimeError(f"Pillow の読み込みに失敗しました: {PIL_IMPORT_ERROR}")
+def _safe_string(value: object) -> str:
+    return str(value).strip() if value is not None else ""
 
 
-def load_config() -> AppConfig:
-    if not CONFIG_PATH.exists():
-        config = AppConfig()
-        save_config(config)
-        return config
+def _safe_int(value: object, default: int) -> int:
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return AppConfig()
-    return AppConfig.from_dict(raw)
-
-
-def save_config(config: AppConfig) -> None:
-    CONFIG_PATH.write_text(json.dumps(config.to_dict(), ensure_ascii=False, indent=2) + WINDOWS_NEWLINE, encoding="utf-8")
-
-
-def read_oriented_image_size(path: Path) -> tuple[int, int]:
-    ensure_pillow_available()
-    assert Image is not None
-    assert ImageOps is not None
-    with Image.open(path) as image:
-        oriented = ImageOps.exif_transpose(image)
-        return tuple(oriented.size)
-
-
-def collect_image_files(folder: Path, extensions: list[str], recursive: bool) -> list[Path]:
-    patterns = folder.rglob("*") if recursive else folder.glob("*")
-    normalized = set(normalize_extensions(extensions))
-    return sorted(
-        [path for path in patterns if path.is_file() and path.suffix.lower() in normalized],
-        key=lambda path: str(path).lower(),
-    )
-
-
-def normalize_extensions(raw_extensions: object) -> list[str]:
-    if isinstance(raw_extensions, str):
-        source = [part.strip() for part in raw_extensions.split(",")]
-    elif isinstance(raw_extensions, list):
-        source = [str(part).strip() for part in raw_extensions]
-    else:
-        source = []
-
-    results: list[str] = []
-    seen: set[str] = set()
-    for item in source:
-        if not item:
-            continue
-        extension = item.lower()
-        if not extension.startswith("."):
-            extension = f".{extension}"
-        if extension in seen:
-            continue
-        seen.add(extension)
-        results.append(extension)
-    return results or list(DEFAULT_EXTENSIONS)
-
-
-def is_supported_extension(extension: str, extensions: list[str]) -> bool:
-    return extension.lower() in set(normalize_extensions(extensions))
-
-
-def assign_output_paths(items: list[ProcessItem], config: AppConfig) -> None:
-    output_root = Path(config.output_folder)
-    reserved: set[str] = set()
-    for item in items:
-        relative_dir = Path()
-        if config.keep_folder_structure_when_folder_added and item.added_via_folder and item.source_root is not None:
-            try:
-                relative_dir = item.source_path.parent.relative_to(item.source_root)
-            except Exception:
-                relative_dir = Path()
-        extension = determine_output_extension(item.source_path, config.output_format)
-        base_relative_path = relative_dir / f"{item.source_path.stem}{config.suffix}{extension}"
-        output_path = output_root / base_relative_path
-        output_key = normalize_path_key(output_path)
-        if config.overwrite and output_key not in reserved:
-            chosen_path = output_path
-            reserved.add(output_key)
-        else:
-            chosen_path = make_unique_output_path(output_path, reserved)
-        item.output_path = chosen_path
-        item.output_name = str(chosen_path.relative_to(output_root)).replace("/", "\\")
-
-
-def determine_output_extension(source_path: Path, output_format: str) -> str:
-    if output_format == "keep_original":
-        extension = source_path.suffix.lower()
-        return extension if extension in PIL_FORMAT_BY_EXTENSION else ".png"
-    if output_format == "jpeg":
-        return ".jpg"
-    if output_format == "png":
-        return ".png"
-    if output_format == "webp":
-        return ".webp"
-    return ".png"
-
-
-def make_unique_output_path(base_path: Path, reserved: set[str]) -> Path:
-    candidate = base_path
-    counter = 1
-    while True:
-        key = normalize_path_key(candidate)
-        if key not in reserved and not candidate.exists():
-            reserved.add(key)
-            return candidate
-        candidate = base_path.with_name(f"{base_path.stem}_{counter:03d}{base_path.suffix}")
-        counter += 1
-
-
-def calculate_output_size(source_size: tuple[int, int], config: AppConfig) -> tuple[int, int]:
-    target_ratio = parse_aspect_ratio(config.target_aspect_ratio)
-    scaled_width = max(1, int(round(source_size[0] * config.x_scale)))
-    scaled_height = max(1, int(round(source_size[1] * config.y_scale)))
-    current_ratio = scaled_width / scaled_height
-    if abs(current_ratio - target_ratio) < 1e-9:
-        return scaled_width, scaled_height
-    if current_ratio < target_ratio:
-        return max(1, int(round(scaled_height * target_ratio))), scaled_height
-    return scaled_width, max(1, int(round(scaled_width / target_ratio)))
-
-
-def render_preview_images(source_path: Path, config: AppConfig) -> tuple[Any, Any, tuple[int, int]]:
-    ensure_pillow_available()
-    before_image, info = load_source_image(source_path)
-    after_image, metadata = build_output_image(before_image, info, config)
-    return before_image.copy(), after_image, metadata["output_size"]
-
-
-def render_output_image(source_path: Path, config: AppConfig) -> tuple[Any, dict[str, Any]]:
-    ensure_pillow_available()
-    image, info = load_source_image(source_path)
-    return build_output_image(image, info, config)
-
-
-def load_source_image(source_path: Path) -> tuple[Any, dict[str, Any]]:
-    ensure_pillow_available()
-    assert Image is not None
-    assert ImageOps is not None
-    with Image.open(source_path) as source:
-        info = dict(source.info)
-        oriented = ImageOps.exif_transpose(source)
-        return oriented.convert("RGB"), info
-
-
-def build_output_image(image: Any, original_info: dict[str, Any], config: AppConfig) -> tuple[Any, dict[str, Any]]:
-    ensure_pillow_available()
-    source_size = tuple(image.size)
-    output_size = calculate_output_size(source_size, config)
-    scaled_size = (
-        max(1, int(round(source_size[0] * config.x_scale))),
-        max(1, int(round(source_size[1] * config.y_scale))),
-    )
-    resample = get_resample_filter(config.interpolation)
-    scaled = image.resize(scaled_size, resample=resample)
-    background = create_background_image(image, scaled, output_size, config.output_canvas_mode, resample)
-
-    offset_x = (output_size[0] - scaled_size[0]) // 2
-    offset_y = (output_size[1] - scaled_size[1]) // 2
-    background.paste(scaled, (offset_x, offset_y))
-    return background, {
-        "source_size": source_size,
-        "scaled_size": scaled_size,
-        "output_size": output_size,
-        "original_info": original_info,
-    }
-
-
-def create_background_image(source_image: Any, scaled_image: Any, output_size: tuple[int, int], mode: str, resample: Any) -> Any:
-    ensure_pillow_available()
-    assert Image is not None
-    assert ImageFilter is not None
-    assert ImageOps is not None
-
-    if mode == "solid_black":
-        return Image.new("RGB", output_size, (0, 0, 0))
-    if mode == "solid_white":
-        return Image.new("RGB", output_size, (255, 255, 255))
-
-    base = ImageOps.fit(source_image, output_size, method=resample, centering=(0.5, 0.5))
-    blur_radius = max(12, int(round(min(output_size) / 28)))
-    blurred = base.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    overlay = Image.new("RGB", output_size, (24, 24, 24))
-    return Image.blend(blurred, overlay, 0.14)
-
-
-def save_output_image(image: Any, output_path: Path, source_path: Path, config: AppConfig) -> None:
-    ensure_pillow_available()
-    assert Image is not None
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    extension = output_path.suffix.lower()
-    image_format = PIL_FORMAT_BY_EXTENSION.get(extension, "PNG")
-    save_kwargs: dict[str, Any] = {}
-
-    if image_format == "JPEG":
-        image = image.convert("RGB")
-        save_kwargs["quality"] = config.jpeg_quality
-        save_kwargs["subsampling"] = 0
-    elif image_format == "WEBP":
-        save_kwargs["quality"] = config.webp_quality
-        save_kwargs["method"] = 6
-
-    if image_format in {"JPEG", "PNG", "WEBP"}:
-        try:
-            with Image.open(source_path) as original:
-                icc_profile = original.info.get("icc_profile")
-                if icc_profile:
-                    save_kwargs["icc_profile"] = icc_profile
-        except Exception:
-            pass
-
-    image.save(output_path, format=image_format, **save_kwargs)
-
-
-def write_report(report_path: Path | None, summary: BatchSummary, items: list[ProcessItem], config: AppConfig) -> None:
-    if report_path is None:
-        return
-    started_text = summary.started_at.strftime("%Y-%m-%d %H:%M:%S")
-    finished_text = (summary.finished_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
-        "画像アスペクト補正レポート",
-        "",
-        f"処理開始時刻: {started_text}",
-        f"処理終了時刻: {finished_text}",
-        f"追加された画像数: {summary.total_count}",
-        f"成功数: {summary.success_count}",
-        f"失敗数: {summary.failure_count}",
-        f"スキップ数: {summary.skip_count}",
-        f"停止要求あり: {bool_to_japanese(summary.stopped)}",
-        "",
-        "使用設定",
-        f"出力フォルダ: {config.output_folder}",
-        f"フォルダドロップを再帰追加: {bool_to_japanese(config.recursive_folder_drop)}",
-        f"フォルダ追加時に階層を保持: {bool_to_japanese(config.keep_folder_structure_when_folder_added)}",
-        f"対象拡張子: {', '.join(config.extensions)}",
-        f"補正モード: {mode_name(config.mode)}",
-        f"横倍率: {config.x_scale:.4f}",
-        f"縦倍率: {config.y_scale:.4f}",
-        f"目標アスペクト比: {config.target_aspect_ratio}",
-        f"出力方式: {canvas_mode_name(config.output_canvas_mode)}",
-        f"出力形式: {output_format_name(config.output_format)}",
-        f"接尾辞: {config.suffix}",
-        f"JPEG画質: {config.jpeg_quality}",
-        f"WebP画質: {config.webp_quality}",
-        f"補間方式: {interpolation_name(config.interpolation)}",
-        f"既存出力を上書き: {bool_to_japanese(config.overwrite)}",
-        f"処理後に元画像を削除: {bool_to_japanese(config.delete_source)}",
-        "",
-        "各画像の処理結果",
-    ]
-
-    if not items:
-        lines.append("画像はありません。")
-    else:
-        for item in items:
-            output_size_text = format_size(item.output_size) if item.output_size is not None else "-"
-            output_aspect_text = item.output_aspect_text if item.output_aspect_text else "-"
-            output_name = item.output_name or "-"
-            error_text = item.error_text or "なし"
-            lines.extend(
-                [
-                    "",
-                    f"ファイル名: {item.source_path.name}",
-                    f"元ファイル: {item.source_path}",
-                    f"状態: {item.status}",
-                    f"元サイズ: {format_size(item.original_size)}",
-                    f"元アスペクト比: {item.original_aspect_text}",
-                    f"補正後サイズ: {output_size_text}",
-                    f"補正後アスペクト比: {output_aspect_text}",
-                    f"横倍率: {config.x_scale:.4f}",
-                    f"縦倍率: {config.y_scale:.4f}",
-                    f"出力方式: {canvas_mode_name(config.output_canvas_mode)}",
-                    f"出力予定名: {output_name}",
-                    f"エラー内容: {error_text}",
-                ]
-            )
-
-    report_path.write_text(WINDOWS_NEWLINE.join(lines) + WINDOWS_NEWLINE, encoding="utf-8")
-
-
-def get_resample_filter(interpolation: str) -> Any:
-    resample = RESAMPLE_MAP.get(interpolation)
-    if resample is None:
-        return RESAMPLE_LANCZOS
-    return resample
-
-
-def parse_aspect_ratio(text: str) -> float:
-    raw = text.strip()
-    if not raw:
-        raise ValueError("目標アスペクト比を指定してください。")
-    if ":" in raw:
-        left, right = raw.split(":", 1)
-        numerator = float(left.strip())
-        denominator = float(right.strip())
-    elif "/" in raw:
-        left, right = raw.split("/", 1)
-        numerator = float(left.strip())
-        denominator = float(right.strip())
-    else:
-        value = float(raw)
-        if value <= 0:
-            raise ValueError("目標アスペクト比は 0 より大きい値にしてください。")
-        return value
-    if numerator <= 0 or denominator <= 0:
-        raise ValueError("目標アスペクト比は 0 より大きい値にしてください。")
-    return numerator / denominator
-
-
-def make_photo_image(image: Any, box_size: tuple[int, int]) -> Any:
-    ensure_pillow_available()
-    assert ImageTk is not None
-    preview = image.copy()
-    preview.thumbnail(box_size, resample=RESAMPLE_LANCZOS)
-    return ImageTk.PhotoImage(preview)
-
-
-def format_size(size: tuple[int, int] | None) -> str:
-    if size is None:
-        return "-"
-    return f"{size[0]} x {size[1]}"
-
-
-def format_ratio_text(width: int, height: int) -> str:
-    if width <= 0 or height <= 0:
-        return "-"
-    return f"{width / height:.4f}"
-
-
-def normalize_path_key(path: Path) -> str:
-    try:
-        return str(path.resolve(strict=False)).lower()
-    except Exception:
-        return str(path.absolute()).lower()
-
-
-def normalize_choice(value: str, mapping: dict[str, str], default_key: str) -> str:
-    if value in mapping:
-        return value
-    reverse_mapping = {label: key for key, label in mapping.items()}
-    return reverse_mapping.get(value, default_key)
-
-
-def canvas_mode_name(mode: str) -> str:
-    return CANVAS_MODE_LABELS.get(mode, mode)
-
-
-def output_format_name(output_format: str) -> str:
-    return OUTPUT_FORMAT_LABELS.get(output_format, output_format)
-
-
-def interpolation_name(interpolation: str) -> str:
-    return INTERPOLATION_LABELS.get(interpolation, interpolation)
-
-
-def mode_name(mode: str) -> str:
-    return MODE_LABELS.get(mode, mode)
-
-
-def bool_to_japanese(value: bool) -> str:
-    return "はい" if value else "いいえ"
-
-
-def _safe_string(value: object, default: str = "") -> str:
-    if value is None:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
         return default
-    text = str(value)
-    return text if text else default
+
+
+def _safe_float(value: object, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
 
 
-def _safe_float(value: object, default: float) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def _safe_int(value: object, default: int) -> int:
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return default
-
-
-def _clamp_int(value: int, lower: int, upper: int) -> int:
+def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
-def _format_number(value: float) -> str:
-    text = f"{value:.4f}"
-    return text.rstrip("0").rstrip(".") if "." in text else text
+def bool_to_japanese(value: bool) -> str:
+    return "はい" if value else "いいえ"
+
+
+def category_name(category: str) -> str:
+    return CATEGORY_NAMES.get(category, category)
+
+
+def face_mode_name(face_mode: str) -> str:
+    return FACE_MODE_NAMES.get(face_mode, face_mode)
+
+
+def face_count_label(face_count: int) -> str:
+    if face_count <= 0:
+        return "顔なし"
+    if face_count == 1:
+        return "顔1つ"
+    return f"顔{face_count}つ"
+
+
+def should_emit_progress_update(current: int, total: int, target_updates: int = 200) -> bool:
+    if total <= 1:
+        return True
+    step = max(1, total // target_updates)
+    return current >= total or current == 1 or (current % step) == 0
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+
+
+def sanitize_path_part(name: str) -> str:
+    sanitized = "".join("_" if character in INVALID_WINDOWS_NAME_CHARS else character for character in name)
+    sanitized = sanitized.strip().rstrip(".")
+    return sanitized or "_"
+
+
+def normalize_zip_member_path(info: zipfile.ZipInfo) -> Path | None:
+    raw_name = info.filename
+    if not (info.flag_bits & 0x800):
+        try:
+            raw_name = raw_name.encode("cp437").decode("cp932")
+        except Exception:
+            pass
+
+    pure_path = PurePosixPath(raw_name)
+    safe_parts: list[str] = []
+    for part in pure_path.parts:
+        if part in {"", ".", "/"}:
+            continue
+        if part == "..":
+            continue
+        drive, tail = os.path.splitdrive(part)
+        if drive:
+            part = tail
+        part = sanitize_path_part(part)
+        if part:
+            safe_parts.append(part)
+
+    if not safe_parts:
+        return None
+    return Path(*safe_parts)
+
+
+def ensure_local_cascade_copy(source_path: Path) -> Path:
+    if not source_path.exists():
+        return source_path
+    cache_dir = BASE_DIR / ".runtime_cache" / "cascades"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target_path = cache_dir / source_path.name
+    if not target_path.exists():
+        target_path.write_bytes(source_path.read_bytes())
+    return target_path
+
+
+def load_rgb_image(image_path: Path) -> Any:
+    assert Image is not None
+    assert ImageOps is not None
+    with Image.open(image_path) as image:
+        image = ImageOps.exif_transpose(image)
+        return image.convert("RGB")
+
+
+def rectangles_to_list(rectangles: Any) -> list[tuple[int, int, int, int]]:
+    if rectangles is None:
+        return []
+    return [tuple(int(value) for value in rect) for rect in rectangles]
+
+
+def calculate_iou(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> float:
+    left_x1, left_y1, left_w, left_h = left
+    right_x1, right_y1, right_w, right_h = right
+    left_x2 = left_x1 + left_w
+    left_y2 = left_y1 + left_h
+    right_x2 = right_x1 + right_w
+    right_y2 = right_y1 + right_h
+
+    intersection_x1 = max(left_x1, right_x1)
+    intersection_y1 = max(left_y1, right_y1)
+    intersection_x2 = min(left_x2, right_x2)
+    intersection_y2 = min(left_y2, right_y2)
+    intersection_w = max(0, intersection_x2 - intersection_x1)
+    intersection_h = max(0, intersection_y2 - intersection_y1)
+    intersection_area = intersection_w * intersection_h
+    if intersection_area <= 0:
+        return 0.0
+    left_area = left_w * left_h
+    right_area = right_w * right_h
+    union_area = left_area + right_area - intersection_area
+    if union_area <= 0:
+        return 0.0
+    return intersection_area / union_area
+
+
+def dedupe_rectangles(rectangles: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    unique: list[tuple[int, int, int, int]] = []
+    for rect in rectangles:
+        if not any(calculate_iou(rect, existing) >= 0.55 for existing in unique):
+            unique.append(rect)
+    return unique
+
+
+def is_face_near_edge(face_rect: tuple[int, int, int, int], image_width: int, image_height: int) -> bool:
+    x, y, width, height = face_rect
+    margin_x = image_width * 0.06
+    margin_y = image_height * 0.06
+    return x < margin_x or y < margin_y or (x + width) > (image_width - margin_x) or (y + height) > (image_height - margin_y)
+
+
+def join_reason_labels(reason_codes: list[str]) -> str:
+    if not reason_codes:
+        return "-"
+    return " / ".join(REASON_LABELS.get(code, code) for code in reason_codes)
+
+
+def load_contact_font(size: int) -> Any:
+    assert ImageFont is not None
+    for font_path in FONT_CANDIDATES:
+        if font_path.exists():
+            try:
+                return ImageFont.truetype(str(font_path), size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def make_thumbnail_image(image_path: Path, thumb_width: int, thumb_height: int) -> Any:
+    assert Image is not None
+    assert ImageOps is not None
+    placeholder = Image.new("RGB", (thumb_width, thumb_height), color=(236, 236, 236))
+    if ImageDraw is not None and ImageFont is not None:
+        draw = ImageDraw.Draw(placeholder)
+        font = load_contact_font(14)
+        draw.multiline_text((12, 14), "画像\nなし", fill=(120, 120, 120), font=font, spacing=2)
+
+    try:
+        image = load_rgb_image(image_path)
+    except Exception:
+        return placeholder
+
+    image.thumbnail((thumb_width, thumb_height), RESAMPLE_LANCZOS)
+    canvas = Image.new("RGB", (thumb_width, thumb_height), color=(236, 236, 236))
+    offset_x = (thumb_width - image.width) // 2
+    offset_y = (thumb_height - image.height) // 2
+    canvas.paste(image, (offset_x, offset_y))
+    return canvas
+
+
+def save_contact_sheet(image: Any, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path, format="JPEG", quality=92, subsampling=0)
+
+
+def write_contact_sheet_error_notice(output_path: Path, title: str, error_message: str) -> None:
+    if Image is None or ImageDraw is None or ImageFont is None:
+        return
+    width = 1280
+    height = 240
+    canvas = Image.new("RGB", (width, height), color=(250, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+    title_font = load_contact_font(22)
+    body_font = load_contact_font(16)
+    draw.text((24, 20), f"{title} の作成に失敗しました", fill=(160, 30, 30), font=title_font)
+    lines = textwrap.wrap(error_message, width=88) or ["不明なエラー"]
+    draw.multiline_text((24, 70), "\n".join(lines[:6]), fill=(60, 60, 60), font=body_font, spacing=4)
+    save_contact_sheet(canvas, output_path)
+
+
+def trim_middle(text: str, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    head = (max_length - 1) // 2
+    tail = max_length - head - 1
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=APP_TITLE)
+    parser.add_argument("--headless-smoke-test", action="store_true", help="GUI を生成してすぐ終了します。")
+    return parser.parse_args(argv)
 
 
 def run_headless_smoke_test() -> int:
-    app = AspectFixApp()
+    app = ZipPreprocessorApp()
     app.update_idletasks()
     app.destroy()
     print(HEADLESS_OK_MESSAGE)
     return 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=APP_TITLE)
-    parser.add_argument("--headless-smoke-test", action="store_true")
-    args = parser.parse_args()
-
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if args.headless_smoke_test:
         return run_headless_smoke_test()
 
-    app = AspectFixApp()
+    app = ZipPreprocessorApp()
     app.mainloop()
     return 0
 

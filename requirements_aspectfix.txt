@@ -1,0 +1,3 @@
+# aspectfix dragdrop gui
+Pillow>=10.0.0
+tkinterdnd2>=0.4.2

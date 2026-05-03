@@ -1,24 +1,16 @@
 {
-  "OutputFolder": "C:\\output_aspect_fixed",
-  "RecursiveFolderDrop": true,
-  "KeepFolderStructureWhenFolderAdded": false,
-  "Extensions": [
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".bmp"
-  ],
-  "Mode": "manual_scale",
-  "XScale": 0.95,
-  "YScale": 1.0,
-  "TargetAspectRatio": "16:9",
-  "OutputCanvasMode": "blur_background",
-  "OutputFormat": "keep_original",
-  "Suffix": "_aspectfix",
-  "JpegQuality": 95,
-  "WebpQuality": 95,
-  "Interpolation": "lanczos",
-  "Overwrite": false,
-  "DeleteSource": false
+  "InputZipFolder": "",
+  "OutputFolder": "",
+  "TempFolder": "",
+  "DoneFolder": "",
+  "SelectedMinFaceRatio": 0.05,
+  "ReviewMinFaceRatio": 0.018,
+  "BlurThreshold": 90.0,
+  "ContactSheetColumns": 5,
+  "ThumbnailWidth": 220,
+  "MoveDoneZip": true,
+  "DeleteTempFolder": true,
+  "OverwriteOutput": false,
+  "CopyExcludeImages": false,
+  "WindowGeometry": "1240x900"
 }
