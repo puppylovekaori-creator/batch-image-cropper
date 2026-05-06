@@ -2,4 +2,6 @@ __pycache__/
 *.py[cod]
 .runtime_cache/
 New-FfmpegFrameExtractCommandGui.settings.json
+*.settings.json.*.bak
+background_remover_gui_settings.json
 logs/

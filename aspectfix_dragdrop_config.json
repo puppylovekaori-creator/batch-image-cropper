@@ -10,9 +10,9 @@
     ".bmp"
   ],
   "Mode": "manual_scale",
-  "XScale": 1.185185,
+  "XScale": 0.95,
   "YScale": 1.0,
-  "DefaultPreset": "720x480 → 16:9表示相当補正",
+  "DefaultPreset": "横を縮める",
   "CanvasMode": "なし",
   "SaveCanvasAspectRatio": "16:9",
   "CanvasPadColor": "黒",
@@ -24,4 +24,4 @@
   "Overwrite": false,
   "DeleteSource": false,
   "WindowGeometry": "1560x980"
-}
+}
